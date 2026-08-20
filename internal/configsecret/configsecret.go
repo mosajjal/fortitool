@@ -18,20 +18,18 @@
 // encoding -- its presence identifies this era. The blob layout is
 // otherwise unchanged (4-byte random IV prefix, zero-padded to 16). The
 // key was recovered by reversing the `init` binary from a real FWF-60E
-// 7.4.11 image, and validated by decrypting all 26 real ENC fields in a
-// real 7.4/2731 backup to clean plaintext -- including the default
-// admin's literal password "guest". The marker itself was separately
-// confirmed byte-identical across 9 real backups spanning Nov 2025-Jan
-// 2026 despite each blob's random IV, which is what first proved it
-// couldn't be part of the CBC ciphertext.
+// 7.4.11 image, and validated by decrypting real ENC fields from a real
+// 7.4/2731 backup to clean plaintext. The marker itself was separately
+// confirmed byte-identical across real backups collected over time
+// despite each blob's random IV, which is what first proved it couldn't
+// be part of the CBC ciphertext.
 //
 // Two distinct blob layouts are shared across both eras, keyed by field
 // type rather than by key:
 //   - Certificate/PKI passwords (config vpn certificate local): a fixed
 //     144-byte zero-padded buffer, NOT PKCS#7 padded -- the real secret
-//     runs up to the first 0x00 byte. Validated against 22 real legacy-era
-//     fields across three firmware versions, and all 26 real 7.4-era
-//     fields in the backup above.
+//     runs up to the first 0x00 byte. Validated against real fields
+//     across multiple firmware versions, in both eras.
 //   - Ordinary short admin/user passwords: standard PKCS#7-padded
 //     ciphertext of whatever length the ("padded to a multiple of 16")
 //     secret needs. Only one real legacy-era sample was available to shape

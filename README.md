@@ -71,13 +71,13 @@ permute argv the way getopt does.
 
 | Layer | Coverage | Status |
 |---|---|---|
-| L1 `.out` outer cipher | v6.x through 8.0, all product lines | **Verified** against 3 real FWF-60E images (7.4.7/7.4.10/7.4.11), byte-identical |
+| L1 `.out` outer cipher | v6.x through 8.0, all product lines | **Verified** against real FWF-60E images (7.4.7/7.4.10/7.4.11), byte-identical |
 | rootfs.gz — ChaCha20+RSA+AES-CTR family | 7.4.1–7.4.11 (ARM + x86_64 splits) | ARM path **verified** byte-identical against real firmware; x86_64 splits ported from public write-ups, covered by a synthetic round-trip test, not run against a real x86 sample |
 | rootfs.gz — XOR+RSA+{FORT-RC4,modified-RC4} family | 7.6.x, 8.0 | Ported from public write-ups (`fgx`, `forticrack_v8`), covered by a synthetic round-trip test, not run against a real sample |
-| ext2/3 filesystem read | FSoC3/ARM appliance MBR+ext3 layout | **Verified** byte-identical against real firmware (including double-indirect block mapping, exercised by a 56MB file) |
+| ext2/3 filesystem read | FSoC3/ARM appliance MBR+ext3 layout | **Verified** byte-identical against real firmware, including double-indirect block mapping |
 | tar/gzip/xz unpack | any | **Verified** byte-identical against real firmware |
-| PKCS#7 SignedData verify | detached signatures (`.x` files), incl. dual-signed | **Verified** against 13 real signed engine/DB files, both signer chains |
-| Config-secret `ENC <base64>` decrypt | legacy + >=7.4 hardcoded keys | **Verified** against real device data. Contrary to common belief, the legacy AES-128 key was never rotated at FortiOS 6.2 — it still works through at least 7.2.3. The 7.4 (build 2731) rotation to a hardcoded AES-256-CBC key was recovered by reversing the `init` binary from a real 7.4.11 image, and **verified** by decrypting all 26 real ENC fields in a real 7.4/2731 backup to clean plaintext; both eras are auto-detected via the unencrypted 8-byte trailer marker the new era appends |
+| PKCS#7 SignedData verify | detached signatures (`.x` files), incl. dual-signed | **Verified** against real signed engine/DB files, both signer chains |
+| Config-secret `ENC <base64>` decrypt | legacy + >=7.4 hardcoded keys | **Verified** against real device data. Contrary to common belief, the legacy AES-128 key was never rotated at FortiOS 6.2 — it still works through at least 7.2.3. The 7.4 (build 2731) rotation to a hardcoded AES-256-CBC key was recovered by reversing the `init` binary from a real firmware image, and **verified** by decrypting real ENC fields from a real device backup to clean plaintext; both eras are auto-detected via the unencrypted 8-byte trailer marker the new era appends |
 
 "Verified" means run against real firmware/config samples and checked
 byte-identical or semantically correct output. Everything else is a

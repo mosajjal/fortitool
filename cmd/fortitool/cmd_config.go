@@ -21,7 +21,7 @@ with a separate, opt-in whole-backup-file passphrase feature
 
 At 7.4 (build 2731) the scheme changed to AES-256-CBC under a new
 hardcoded key, recovered by reversing the 'init' binary from a real 7.4.11
-image and validated by decrypting all 26 real ENC fields in a real 7.4/2731
+image and validated by decrypting real ENC fields from a real 7.4/2731
 backup to clean plaintext. Blobs from that era are identified by an
 unencrypted 8-byte trailer marker and routed to the new key
 automatically -- no flags needed.
