@@ -1,0 +1,13 @@
+/fortitool
+/dist/
+*.out
+*.decrypted
+*.dec
+*.dec.gz
+
+# Never commit real firmware or anything derived from it -- see README's
+# legal note. If you generate local fixtures for manual testing, keep them
+# outside this tree or under a path listed here.
+/testdata/*.img
+/testdata/*.cpio
+/testdata/*.out
