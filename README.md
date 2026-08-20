@@ -32,6 +32,24 @@ promises — without it, Go links against glibc for the (unused) net
 resolver. Verify with `file fortitool` (should say "statically linked") or
 `ldd fortitool` (should say "not a dynamic executable").
 
+### As a Claude Code plugin
+
+This repo is also a self-hosted [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces),
+bundling a skill that teaches Claude when and how to reach for `fortitool`
+(build/install it, which subcommand fits the task, the flags-before-args
+gotcha, the responsible-use boundary) so it can drive the CLI correctly
+without you spelling out every flag:
+
+```
+/plugin marketplace add mosajjal/fortitool
+/plugin install fortitool@fortitool
+```
+
+`claude plugin validate .claude-plugin/marketplace.json --strict` and
+`claude plugin validate .claude-plugin/plugin.json --strict` both pass;
+the skill was verified with a real local `marketplace add` /
+`plugin install` cycle (see `skills/fortios-firmware/SKILL.md`).
+
 ## Usage
 
 ```sh

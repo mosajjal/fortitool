@@ -1,0 +1,23 @@
+{
+  "name": "fortitool",
+  "displayName": "fortitool",
+  "version": "0.1.0",
+  "description": "Decrypt and unpack FortiOS firmware end-to-end: the outer .out cipher, every known rootfs.gz crypto scheme (7.4.x-8.0, auto-detected), the ext3 firmware filesystem, tar/xz archives, PKCS#7 sub-component signatures, and config-backup secrets. One static Go binary, no OS packages required at runtime.",
+  "author": {
+    "name": "Ali Mosajjal",
+    "url": "https://github.com/mosajjal"
+  },
+  "homepage": "https://github.com/mosajjal/fortitool",
+  "repository": "https://github.com/mosajjal/fortitool",
+  "license": "MIT",
+  "keywords": [
+    "fortios",
+    "fortigate",
+    "fortiwifi",
+    "fortinet",
+    "firmware",
+    "reverse-engineering",
+    "decryption",
+    "security-research"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "fortitool",
+  "description": "FortiOS firmware decryption tooling by Ali Mosajjal - the fortitool CLI/skill for decrypting and unpacking FortiOS firmware end-to-end.",
+  "owner": {
+    "name": "Ali Mosajjal",
+    "url": "https://github.com/mosajjal"
+  },
+  "plugins": [
+    {
+      "name": "fortitool",
+      "source": "./plugin",
+      "description": "Decrypt and unpack FortiOS firmware end-to-end - outer cipher, every known rootfs.gz crypto scheme auto-detected, ext3, tar/xz, PKCS#7 signatures, config secrets. One static Go binary, no OS deps.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "author": {
+        "name": "Ali Mosajjal",
+        "url": "https://github.com/mosajjal"
+      },
+      "keywords": ["fortios", "fortigate", "firmware", "security-research"]
+    }
+  ]
+}
