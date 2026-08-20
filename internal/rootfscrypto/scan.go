@@ -6,9 +6,16 @@
 // Two obfuscation families are known, and this package auto-detects both
 // without any disassembly (miasm/objdump), by exploiting that the blob
 // always decrypts to a known ASN.1 DER prefix:
-//   - XOR family (7.6.x aarch64, 8.0 FORT-RC4): blob[i] ^ seed[i&0x1F]
+//   - XOR family (7.6.x aarch64, 8.0 FORT-RC4): blob[i] ^ seed[i&0x1F].
+//     The contiguous/near-contiguous XOR scan here generalizes the
+//     disassembly-free technique from hackintoanetwork/fgx
+//     (https://github.com/hackintoanetwork/fgx).
 //   - ChaCha20 family (7.4.1-7.4.11, ARM+x86): key/iv = SHA256 of seed with
-//     one of several observed byte-rotation splits
+//     one of several observed byte-rotation splits, generalizing this
+//     project's own earlier fwf_find_crypto_material.py (ARM/FSoC3, this
+//     repo's own finding) plus the split points documented by RandoriSec
+//     (https://blog.randorisec.fr/fortigate-rootfs-decryption/) and
+//     noways-io/fortigate-crypto (https://github.com/noways-io/fortigate-crypto)
 package rootfscrypto
 
 import (

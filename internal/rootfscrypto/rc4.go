@@ -1,10 +1,11 @@
 package rootfscrypto
 
 // fortRC4 is Fortinet's "FORT-RC4" stream cipher (FortiOS 8.0, PKCS#1-signed
-// 32-byte key). Standard RC4 KSA, then a modified PRGA that mixes two
-// cross-rotated S-box lookups with a 0xAA constant. Two silicon-level
-// variants exist depending on whether the compiled kernel zeroes i/j before
-// the PRGA loop (FGT) or lets KSA's final j flow through (FFW).
+// 32-byte key), reversed by hacefresko (https://github.com/hacefresko/forticrack_v8).
+// Standard RC4 KSA, then a modified PRGA that mixes two cross-rotated S-box
+// lookups with a 0xAA constant. Two silicon-level variants exist depending
+// on whether the compiled kernel zeroes i/j before the PRGA loop (FGT) or
+// lets KSA's final j flow through (FFW).
 func fortRC4(key, data []byte, resetJ bool) []byte {
 	var s [256]byte
 	for i := range s {
@@ -42,7 +43,8 @@ func fortRC4(key, data []byte, resetJ bool) []byte {
 	return out
 }
 
-// modifiedRC4 is FortiOS 7.6.x's distinct modified-RC4 rootfs cipher:
+// modifiedRC4 is FortiOS 7.6.x's distinct modified-RC4 rootfs cipher,
+// reversed by hackintoanetwork (https://github.com/hackintoanetwork/fgx):
 // standard KSA, then a PRGA with cross-rotated i/j byte halves and a
 // multi-lookup output mix using the constant 0xFFFFFFAA. keepJ selects
 // whether PRGA continues from KSA's final j (some kernel builds) or resets

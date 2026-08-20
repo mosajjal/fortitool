@@ -1,9 +1,11 @@
 // Package configsecret decrypts FortiGate config-backup secrets (the
 // base64 blobs behind `ENC` fields in a `.conf` backup).
 //
-// The commonly repeated belief is that Fortinet's PSIRT advisory
-// FG-IR-19-007 rotated the hardcoded AES-128-CBC key from CVE-2019-6693
-// ("Mary had a littl") at FortiOS 6.2. Reverse engineering against real
+// The legacy key and blob layout are from gquere's CVE-2019-6693 disclosure
+// and reference decryptor (https://github.com/gquere/CVE-2019-6693). The
+// commonly repeated belief is that Fortinet's PSIRT advisory FG-IR-19-007
+// rotated that hardcoded AES-128-CBC key ("Mary had a littl") at FortiOS
+// 6.2. Reverse engineering against real
 // device backups (see the project README) found that belief conflates two
 // different features: the advisory's actual fix is the separate, opt-in
 // `private-data-encryption` whole-backup-file passphrase feature. The

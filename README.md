@@ -104,6 +104,49 @@ generated fixtures (self-signed certs, hand-built ext2 images, round-trip
 crypto vectors) — no copyrighted firmware is needed to run or verify this
 code. Run `go test ./...`.
 
+## Acknowledgments
+
+`fortitool` exists because several researchers already did the hard part —
+finding and documenting these crypto schemes in the first place. Every
+algorithm below is a from-scratch Go reimplementation written from reading
+their public writeups/source (not copied code — several of these projects
+are GPL-licensed, which this MIT-licensed project doesn't inherit from
+because no source was copied — but full credit is owed regardless):
+
+- **[BishopFox/forticrack](https://github.com/BishopFox/forticrack)** (GPL-3.0) —
+  the L1 `.out` known-plaintext attack this project's `internal/l1` is a
+  reimplementation of, plus the original writeups
+  ["Breaking Fortinet Firmware Encryption"](https://bishopfox.com/blog/breaking-fortinet-firmware-encryption)
+  and ["Further Adventures in Fortinet Decryption"](https://bishopfox.com/blog/further-adventures-in-fortinet-decryption)
+  (ChaCha20 rootfs scheme, 7.4.1–7.4.3).
+- **[hacefresko/forticrack_v8](https://github.com/hacefresko/forticrack_v8)** —
+  the FortiOS 8.0 FORT-RC4 rootfs cipher (both FGT/FFW silicon variants)
+  `internal/rootfscrypto`'s `fortRC4` is based on.
+- **[hackintoanetwork/fgx](https://github.com/hackintoanetwork/fgx)** (GPL-3.0) —
+  the FortiOS 7.6.x modified-RC4 rootfs cipher, and the disassembly-free
+  seed/RSA-key scanning approach (contiguous + near-contiguous layouts)
+  this project's universal scanner generalizes.
+- **[noways-io/fortigate-crypto](https://github.com/noways-io/fortigate-crypto)** (Apache-2.0) —
+  the original C reference for the 7.4.2/7.4.3 x86_64 ChaCha20 rootfs
+  key-derivation splits.
+- **[RandoriSec](https://blog.randorisec.fr/fortigate-rootfs-decryption/)** —
+  the 7.4.7+ stripped-kernel rootfs decryption writeup this project's ARM
+  adaptation (independently found via this project's earlier Python
+  tooling, see the parent research repo) builds on the same technique from.
+- **[gquere/CVE-2019-6693](https://github.com/gquere/CVE-2019-6693)** — the
+  original disclosure and reference decryptor for the legacy config-secret
+  AES-CBC scheme `internal/configsecret` implements (and whose real
+  applicability range — never rotated at 6.2, actually rotated at 7.4 —
+  this project corrected via device-level reverse engineering).
+- **[mosajjal/forticrack](https://github.com/mosajjal/forticrack)** (fork,
+  branch `improvements-magic-exitcodes-streaming`) — this project's own
+  earlier contribution to Bishop Fox's tool (both-endianness magic
+  detection, reliable key reporting, streaming decryption), which
+  `internal/l1`'s both-magic-endianness handling is carried over from.
+
+If you're one of the people behind these projects and want different
+attribution, open an issue.
+
 ## Legal / responsible use
 
 Only use this against firmware for hardware you own, for security research
