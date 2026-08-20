@@ -43,9 +43,9 @@ parser doesn't permute argv).
 - `decrypt` currently targets the FSoC3/ARM appliance MBR+ext3 partition
   layout. If it fails partway through on an x86/VM image, fall back to
   `l1` + `rootfs` as building blocks against the extracted partition.
-- `config decrypt` only knows the legacy key (works through FortiOS
-  7.2.3). Blobs from 7.4+ are detected and reported as unsupported, not
-  silently mis-decrypted -- don't retry those with different flags, they
-  need a key that isn't in this tool yet.
+- `config decrypt` auto-detects and handles both known key eras (legacy,
+  through FortiOS 7.2.3, and >=7.4/build 2731) -- no flags needed. If it
+  still reports an unrecognized format, the field's blob layout isn't one
+  of the two known ones yet, not a version issue.
 - Exit code 0 = succeeded (including "already cleartext" / recognized
   unsupported cases where relevant); 1 = failed; 2 = usage error.

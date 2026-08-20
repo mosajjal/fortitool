@@ -77,7 +77,7 @@ permute argv the way getopt does.
 | ext2/3 filesystem read | FSoC3/ARM appliance MBR+ext3 layout | **Verified** byte-identical against real firmware (including double-indirect block mapping, exercised by a 56MB file) |
 | tar/gzip/xz unpack | any | **Verified** byte-identical against real firmware |
 | PKCS#7 SignedData verify | detached signatures (`.x` files), incl. dual-signed | **Verified** against 13 real signed engine/DB files, both signer chains |
-| Config-secret `ENC <base64>` decrypt | legacy hardcoded key | **Verified** against real device data. Contrary to common belief, this key was never rotated at FortiOS 6.2 — it still works through at least 7.2.3. It changed at 7.4 (build 2731) to a key that has not been identified; that era is detected (an unencrypted 8-byte trailer marker) and reported rather than silently mis-decrypted |
+| Config-secret `ENC <base64>` decrypt | legacy + >=7.4 hardcoded keys | **Verified** against real device data. Contrary to common belief, the legacy AES-128 key was never rotated at FortiOS 6.2 — it still works through at least 7.2.3. The 7.4 (build 2731) rotation to a hardcoded AES-256-CBC key was recovered by reversing the `init` binary from a real 7.4.11 image, and **verified** by decrypting all 26 real ENC fields in a real 7.4/2731 backup to clean plaintext; both eras are auto-detected via the unencrypted 8-byte trailer marker the new era appends |
 
 "Verified" means run against real firmware/config samples and checked
 byte-identical or semantically correct output. Everything else is a
@@ -177,9 +177,8 @@ anything you don't own or have explicit authorization to test.
 ## Contributing
 
 Issues and PRs welcome, especially real-firmware validation of the
-not-yet-verified paths in the table above (7.6.x, 8.0, x86_64 builds), or
-progress on the unidentified >=7.4 config-secret key. Run `go build ./...
-&& go vet ./... && go test ./...` before submitting.
+not-yet-verified paths in the table above (7.6.x, 8.0, x86_64 builds). Run
+`go build ./... && go vet ./... && go test ./...` before submitting.
 
 ## License
 
