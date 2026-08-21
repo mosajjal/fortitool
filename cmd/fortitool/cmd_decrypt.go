@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"github.com/mosajjal/fortitool/internal/archive"
 	"github.com/mosajjal/fortitool/internal/diskimage"
 	"github.com/mosajjal/fortitool/internal/l1"
+	"github.com/mosajjal/fortitool/internal/qcow2"
 )
 
 // nestedTarXZMembers are the tar+xz archives FortiOS nests inside the outer
@@ -27,18 +29,17 @@ Runs the whole chain in order, auto-detecting the crypto era at each
 layer (no version/model/architecture flag needed):
   1. gunzip the outer .out wrapper
   2. L1 XOR decrypt (known-plaintext attack, or detect already-cleartext)
-  3. read the ext3 volume at MBR offset 512 (pure Go, no mount/debugfs)
+  3. locate the FORTIOS volume -- appliance images (MBR + ext3 @512),
+     VM/KVM images (qcow2 disk with partitioned ext filesystems), and
+     fixed-offset layouts (e.g. FortiManager @0x400000) are all handled,
+     pure Go, no mount/debugfs/7z
   4. locate flatkc + rootfs.gz, extract datafs.tar.gz/devicetree.dtb/etc
      alongside them if present
   5. decrypt rootfs.gz (any known FortiOS 7.4.x-8.0 scheme)
-  6. unpack the rootfs tar, then merge in any nested bin.tar.xz/
+  6. unpack the rootfs payload -- gzip tar (<=7.6) or xz-compressed ext4
+     filesystem image (8.0 VM) -- then merge in any nested bin.tar.xz/
      usr.tar.xz/migadmin.tar.xz/node-scripts.tar.xz members, then unpack
      datafs.tar.gz if present
-
-This currently targets the FSoC3/ARM appliance MBR+ext3 image layout
-(verified end-to-end against real FWF-60E firmware) -- x86/VM images may
-use a different partition layout not yet handled here; use 'fortitool l1'
-+ 'fortitool rootfs' as building blocks if this fails partway through.
 
 USAGE
   fortitool decrypt -o OUTDIR <image.out>
@@ -100,28 +101,19 @@ EXIT CODES
 		fmt.Println("      already cleartext")
 	}
 
-	fmt.Println("[3/6] reading ext3 volume (MBR @512)")
-	if len(plain) < 512 {
-		return fmt.Errorf("decrypted image too small to contain an MBR + ext3 volume")
-	}
-	part := plain[512:]
-	volume, err := diskimage.Open(part)
+	fmt.Println("[3/6] locating the FORTIOS volume")
+	volume, layout, err := openVolume(plain)
 	if err != nil {
-		return fmt.Errorf("ext3 open: %w", err)
+		return fmt.Errorf("volume discovery: %w", err)
 	}
-	entries, err := volume.ReadDir("")
-	if err != nil {
-		return fmt.Errorf("ext3 root readdir: %w", err)
-	}
-	fmt.Printf("      %d root entries\n", len(entries))
+	fmt.Printf("      layout: %s\n", layout)
 
 	extract := func(name string) ([]byte, error) {
-		for _, e := range entries {
-			if e.Name == name {
-				return volume.ReadFile(name)
-			}
+		data, err := volume.ReadFile(name)
+		if err != nil {
+			return nil, nil // absent -- not every image carries every optional file
 		}
-		return nil, nil // absent -- not every image carries every optional file
+		return data, nil
 	}
 
 	flatkc, err := extract("flatkc")
@@ -133,7 +125,7 @@ EXIT CODES
 		return fmt.Errorf("reading rootfs.gz: %w", err)
 	}
 	if flatkc == nil || rootfsGz == nil {
-		return fmt.Errorf("flatkc or rootfs.gz not found in ext3 volume root (%d entries listed)", len(entries))
+		return fmt.Errorf("flatkc or rootfs.gz not found in the located volume")
 	}
 	if err := os.WriteFile(filepath.Join(*outDir, "flatkc"), flatkc, 0o644); err != nil {
 		return err
@@ -158,10 +150,10 @@ EXIT CODES
 		return err
 	}
 
-	fmt.Println("[5/6] unpacking rootfs tar")
+	fmt.Println("[5/6] unpacking rootfs payload")
 	rootfsDir := filepath.Join(*outDir, "rootfs")
-	if err := archive.ExtractGzipTar(rootfsPlain, rootfsDir); err != nil {
-		return fmt.Errorf("rootfs untar: %w", err)
+	if err := extractRootfsPayload(rootfsPlain, rootfsDir); err != nil {
+		return fmt.Errorf("rootfs unpack: %w", err)
 	}
 
 	fmt.Println("[6/6] unpacking nested tar+xz members")
@@ -196,4 +188,77 @@ EXIT CODES
 		fmt.Printf("\n[+] DONE: unpacked under %s\n", *outDir)
 	}
 	return nil
+}
+
+// openVolume locates a readable ext filesystem inside a decrypted firmware
+// image, handling every known on-disk layout:
+//
+//   - qcow2 VM disks (FortiGate/FortiManager VM .out payloads): the guest
+//     disk is exposed read-only via internal/qcow2, then scanned for ext
+//     volumes exactly like a raw disk;
+//   - raw disks with an MBR partition table (appliance images keep their
+//     ext3 volume at sector 1; VM boot disks carry several partitions);
+//   - fixed-offset layouts with no partition table (some FortiManager
+//     images start their volume at 0x400000).
+//
+// When several candidate volumes exist (partitioned VM disks), the one
+// actually containing flatkc + rootfs.gz wins.
+func openVolume(img []byte) (*diskimage.FS, string, error) {
+	var (
+		fss    []*diskimage.FS
+		layout string
+	)
+	switch {
+	case qcow2.IsQCow2(img):
+		rd, err := qcow2.Open(bytes.NewReader(img))
+		if err != nil {
+			return nil, "", fmt.Errorf("qcow2: %w", err)
+		}
+		fss = diskimage.FindFilesystems(rd, rd.Size())
+		layout = fmt.Sprintf("qcow2 VM disk (%d MB virtual)", rd.Size()>>20)
+	default:
+		fss = diskimage.FindFilesystems(bytes.NewReader(img), int64(len(img)))
+		layout = "raw disk"
+	}
+	if len(fss) == 0 {
+		return nil, "", fmt.Errorf("no ext2/3/4 filesystem found in the decrypted image (tried MBR partitions, offset 512, and common fixed offsets)")
+	}
+	for _, vol := range fss {
+		if _, err := vol.ReadFile("flatkc"); err != nil {
+			continue
+		}
+		if _, err := vol.ReadFile("rootfs.gz"); err != nil {
+			continue
+		}
+		return vol, layout, nil
+	}
+	// no volume has both files; hand back the first so the caller can
+	// produce a precise error about what IS there
+	return fss[0], layout, nil
+}
+
+// extractRootfsPayload unpacks a decrypted rootfs body. Two container
+// shapes exist across the product line:
+//
+//   - gzip-compressed GNU tar (everything through 7.6.x): extracted as a
+//     plain tar;
+//   - xz-compressed ext4 filesystem image (8.0 VM builds): decompressed,
+//     then dumped file-by-file through the pure-Go ext reader.
+func extractRootfsPayload(plain []byte, destDir string) error {
+	switch {
+	case len(plain) >= 2 && plain[0] == 0x1f && plain[1] == 0x8b:
+		return archive.ExtractGzipTar(plain, destDir)
+	case len(plain) >= 6 && bytes.Equal(plain[:6], []byte("\xfd7zXZ\x00")):
+		raw, err := archive.XZDecompress(plain)
+		if err != nil {
+			return fmt.Errorf("xz decompress: %w", err)
+		}
+		vol, err := diskimage.Open(raw)
+		if err != nil {
+			return fmt.Errorf("decompressed payload is not an ext filesystem: %w", err)
+		}
+		return vol.ExtractAll(destDir)
+	default:
+		return fmt.Errorf("decrypted rootfs is neither gzip nor xz (starts %x)", plain[:6])
+	}
 }

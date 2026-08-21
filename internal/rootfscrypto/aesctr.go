@@ -2,13 +2,11 @@ package rootfscrypto
 
 import "crypto/aes"
 
-// aesCustomCTR implements Fortinet's non-standard AES-CTR, first documented
-// by RandoriSec (https://blog.randorisec.fr/fortigate-rootfs-decryption/)
-// and noways-io (https://github.com/noways-io/fortigate-crypto) for x86_64:
-// a 16-byte counter block (8-byte nonce || 8-byte little-endian counter)
-// that increments by a per-image step (XOR of the nibbles of every counter
-// byte, minimum 1) instead of by 1. This implementation is verified
-// against real FWF-60E 7.4.7/7.4.10/7.4.11 (ARM/FSoC3) images.
+// aesCustomCTR implements Fortinet's non-standard AES-CTR: a 16-byte
+// counter block (8-byte nonce || 8-byte little-endian counter) that
+// increments by a per-image step (XOR of the nibbles of every counter
+// byte, minimum 1) instead of by 1. Verified against real FWF-60E
+// 7.4.7/7.4.10/7.4.11 images.
 func aesCustomCTR(key, nonce8 []byte, counter0 uint64, step uint64, data []byte) []byte {
 	block, err := aes.NewCipher(key)
 	if err != nil {

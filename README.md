@@ -32,24 +32,6 @@ promises — without it, Go links against glibc for the (unused) net
 resolver. Verify with `file fortitool` (should say "statically linked") or
 `ldd fortitool` (should say "not a dynamic executable").
 
-### As a Claude Code plugin
-
-This repo is also a self-hosted [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces),
-bundling a skill that teaches Claude when and how to reach for `fortitool`
-(build/install it, which subcommand fits the task, the flags-before-args
-gotcha, the responsible-use boundary) so it can drive the CLI correctly
-without you spelling out every flag:
-
-```
-/plugin marketplace add mosajjal/fortitool
-/plugin install fortitool@fortitool
-```
-
-`claude plugin validate .claude-plugin/marketplace.json --strict` and
-`claude plugin validate .claude-plugin/plugin.json --strict` both pass;
-the skill was verified with a real local `marketplace add` /
-`plugin install` cycle (see `skills/fortios-firmware/SKILL.md`).
-
 ## Usage
 
 ```sh
@@ -73,11 +55,14 @@ permute argv the way getopt does.
 |---|---|---|
 | L1 `.out` outer cipher | v6.x through 8.0, all product lines | **Verified** against real FWF-60E images (7.4.7/7.4.10/7.4.11), byte-identical |
 | rootfs.gz — ChaCha20+RSA+AES-CTR family | 7.4.1–7.4.11 (ARM + x86_64 splits) | ARM path **verified** byte-identical against real firmware; x86_64 splits ported from public write-ups, covered by a synthetic round-trip test, not run against a real x86 sample |
+| rootfs.gz — ChaCha20 body (7.4.1–7.4.3 era) | seed-derived key/IV, non-RFC7539 counter | Ported from `fortigate-crypto`/Bishop Fox, covered by a synthetic round-trip test, not run against a real sample of that era |
 | rootfs.gz — XOR+RSA+{FORT-RC4,modified-RC4} family | 7.6.x, 8.0 | Ported from public write-ups (`fgx`, `forticrack_v8`), covered by a synthetic round-trip test, not run against a real sample |
+| Disk image layouts | appliance MBR+ext3 @512; **qcow2 VM disks** (FortiGate/FortiManager VM `.out` payloads); fixed-offset volumes (e.g. FortiManager @0x400000) | Appliance path **verified** byte-identical against real firmware; qcow2 reader + partition/ext4-extent discovery covered by synthetic round-trip tests, not yet run against a real VM image |
 | ext2/3 filesystem read | FSoC3/ARM appliance MBR+ext3 layout | **Verified** byte-identical against real firmware, including double-indirect block mapping |
+| ext4 extent-mapped read | FortiOS 8.0 VM rootfs (xz-compressed ext4 image) | Synthetic round-trip tests only, no real 8.0 sample available |
 | tar/gzip/xz unpack | any | **Verified** byte-identical against real firmware |
 | PKCS#7 SignedData verify | detached signatures (`.x` files), incl. dual-signed | **Verified** against real signed engine/DB files, both signer chains |
-| Config-secret `ENC <base64>` decrypt | legacy + >=7.4 hardcoded keys | **Verified** against real device data. Contrary to common belief, the legacy AES-128 key was never rotated at FortiOS 6.2 — it still works through at least 7.2.3. The 7.4 (build 2731) rotation to a hardcoded AES-256-CBC key was recovered by reversing the `init` binary from a real firmware image, and **verified** by decrypting real ENC fields from a real device backup to clean plaintext; both eras are auto-detected via the unencrypted 8-byte trailer marker the new era appends |
+| Config-secret `ENC <base64>` decrypt | all eras | Legacy hardcoded AES-128 key **verified** against real device data through at least 7.2.3 (contrary to common belief it was never rotated at 6.2). The >=7.4 (build 2731) AES-256-CBC key was recovered by RE of the init monolith and **verified against real device backups spanning both eras** — both keys embedded, see [Config-secret keys](#config-secret-keys) |
 
 "Verified" means run against real firmware/config samples and checked
 byte-identical or semantically correct output. Everything else is a
@@ -85,10 +70,31 @@ faithful port of a documented, working reference implementation, exercised
 by this repo's test suite, but not yet run against a real sample of that
 specific era — patches with real-firmware validation welcome.
 
-Currently `decrypt` (the full pipeline) targets the FSoC3/ARM appliance
-MBR+ext3 partition layout. x86/VM firmware images may use a different
-layout; use `l1` and `rootfs` as building blocks against extracted
-partition files if the one-shot pipeline doesn't apply to your image.
+`decrypt` handles every known disk layout in one shot: appliance images
+(MBR + ext3 at sector 512), VM/KVM images (the decrypted payload is a
+qcow2 disk whose partitions are scanned for the FORTIOS volume), and
+fixed-offset layouts. The rootfs payload may be a gzip tar (through 7.6.x)
+or an xz-compressed ext4 filesystem image (8.0 VM builds) — both are
+unpacked natively.
+
+## Config-secret keys
+
+`fortitool config decrypt` handles both eras of FortiOS config-backup
+secrets with their hardcoded keys embedded:
+
+* **Pre-7.4 (6.2–7.2.x):** the AES-128 key published with CVE-2019-6693
+  in 2019.
+* **>=7.4 (build 2731):** an AES-256 key recoverable by reverse
+  engineering the firmware's init monolith, where it ships as a static
+  constant in every image of that era. It is included here on the same
+  basis as the firmware-unpacking material and the CVE-2019-6693 key:
+  anyone with any image of the era can derive it in an afternoon, and
+  public precedent treats such constants as fair-published.
+
+Practical consequence either way: **a FortiOS config backup should be
+treated as plaintext-adjacent.** Don't post one to forums or ticket
+systems, and use the optional `private-data-encryption` passphrase
+feature if a backup may travel.
 
 ## How the auto-detection works
 
@@ -110,10 +116,12 @@ checking for the gzip magic bytes in the output.
 internal/l1            outer .out XOR cipher (known-plaintext attack)
 internal/kernelpayload  flatkc -> decompressed kernel bytes
 internal/rootfscrypto   seed/RSA-key scanner + all rootfs.gz body ciphers
-internal/diskimage      read-only ext2/ext3 (MBR-stripped partition -> files)
+internal/qcow2          read-only qcow2 (VM disk) reader
+internal/diskimage      read-only ext2/ext3/ext4 (MBR partitions, fixed-offset
+                        volumes, extent-mapped inodes, ExtractAll dump)
 internal/archive        tar/gzip/xz unpacking (stdlib + pure-Go xz)
 internal/pkcs7          PKCS#7 SignedData parse + detached-signature verify
-internal/configsecret   config-backup ENC secret decrypt
+internal/configsecret   config-backup ENC secret decrypt, all eras
 cmd/fortitool           CLI wiring the above into the commands above
 ```
 
@@ -150,18 +158,12 @@ because no source was copied — but full credit is owed regardless):
 - **[RandoriSec](https://blog.randorisec.fr/fortigate-rootfs-decryption/)** —
   the 7.4.7+ stripped-kernel rootfs decryption writeup this project's ARM
   adaptation (independently found via this project's earlier Python
-  tooling, see the parent research repo) builds on the same technique from.
+  tooling) builds on the same technique from.
 - **[gquere/CVE-2019-6693](https://github.com/gquere/CVE-2019-6693)** — the
   original disclosure and reference decryptor for the legacy config-secret
   AES-CBC scheme `internal/configsecret` implements (and whose real
   applicability range — never rotated at 6.2, actually rotated at 7.4 —
   this project corrected via device-level reverse engineering).
-- **[mosajjal/forticrack](https://github.com/mosajjal/forticrack)** (fork,
-  branch `improvements-magic-exitcodes-streaming`) — this project's own
-  earlier contribution to Bishop Fox's tool (both-endianness magic
-  detection, reliable key reporting, streaming decryption), which
-  `internal/l1`'s both-magic-endianness handling is carried over from.
-
 If you're one of the people behind these projects and want different
 attribution, open an issue.
 
@@ -177,8 +179,9 @@ anything you don't own or have explicit authorization to test.
 ## Contributing
 
 Issues and PRs welcome, especially real-firmware validation of the
-not-yet-verified paths in the table above (7.6.x, 8.0, x86_64 builds). Run
-`go build ./... && go vet ./... && go test ./...` before submitting.
+not-yet-verified paths in the table above (7.6.x, 8.0, x86_64 builds,
+qcow2 VM images). Run `go build ./... && go vet ./... && go test ./...`
+before submitting.
 
 ## License
 

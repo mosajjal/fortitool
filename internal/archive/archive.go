@@ -41,6 +41,17 @@ func ExtractXZTar(data []byte, destDir string) error {
 	return Untar(xr, destDir)
 }
 
+// XZDecompress fully decompresses a raw xz stream (not a tar). This is
+// what a FortiOS 8.0 VM rootfs body becomes after decryption: an
+// xz-compressed ext4 filesystem image rather than a gzipped tar.
+func XZDecompress(data []byte) ([]byte, error) {
+	xr, err := xz.NewReader(newByteReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("xz: %w", err)
+	}
+	return io.ReadAll(xr)
+}
+
 // Untar extracts a tar stream to destDir, handling regular files,
 // directories, and symlinks (FortiOS rootfs trees use symlinks heavily,
 // e.g. /etc -> data/etc).

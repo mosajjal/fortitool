@@ -13,20 +13,18 @@ const configHelp = `fortitool config decrypt -- decrypt a FortiOS config-backup 
 
 FortiOS config backups embed secrets (passwords, PSKs, certificate
 passphrases) as 'set <field> ENC <base64>' lines. This decrypts one such
-base64 blob. Contrary to the commonly repeated belief that the hardcoded
-key was rotated at FortiOS 6.2, it was NOT -- that belief conflates it
-with a separate, opt-in whole-backup-file passphrase feature
-('private-data-encryption'). The legacy AES-128-CBC key from CVE-2019-6693
-("Mary had a littl") still works through at least FortiOS 7.2.3.
+base64 blob, auto-detecting the crypto era:
 
-At 7.4 (build 2731) the scheme changed to AES-256-CBC under a new
-hardcoded key, recovered by reversing the 'init' binary from a real 7.4.11
-image and validated by decrypting real ENC fields from a real 7.4/2731
-backup to clean plaintext. Blobs from that era are identified by an
-unencrypted 8-byte trailer marker and routed to the new key
-automatically -- no flags needed.
+  - pre-7.4: legacy hardcoded AES-128-CBC key from CVE-2019-6693 ("Mary
+    had a littl"). Contrary to the commonly repeated belief that this key
+    was rotated at FortiOS 6.2, it was NOT -- that belief conflates it
+    with a separate, opt-in whole-backup-file passphrase feature
+    ('private-data-encryption'). It still works through at least 7.2.3.
+  - >=7.4 (build 2731): AES-256-CBC with a hardcoded key (reverse
+    engineered from the init monolith; blobs from this era carry an
+    unencrypted 8-byte "Yf267vE@" trailer that keys the detection).
 
-Two blob layouts are auto-detected for either era:
+Two blob layouts are auto-detected within each era:
   - cert-fixed144: certificate/PKI password fields, a fixed 144-byte
     zero-padded buffer. Validated against real device data.
   - pkcs7-variable: ordinary short admin/user passwords, standard
@@ -44,8 +42,8 @@ EXAMPLE
   fortitool config decrypt AK17UY25Ahhm2bZ5zcMnW5RtgnPP3hupkQ1v6GP2LDtDu0=
 
 EXIT CODES
-  0  decrypted (secret printed), OR a recognized-but-unsupported case
-     (neither known layout matched) -- check stdout for which
+  0  decrypted (secret printed), OR an unrecognized field type (neither
+     known layout matched) -- check stdout for which
   1  malformed input (bad base64, too short to contain an IV)
 `
 
@@ -58,9 +56,9 @@ func cmdConfig(_ context.Context, args []string) error {
 		fmt.Fprint(os.Stderr, configHelp)
 		return fmt.Errorf("usage: fortitool config decrypt <base64-blob>")
 	}
-	res, err := configsecret.DecryptLegacy(args[1])
+	res, err := configsecret.Decrypt(args[1])
 	if err != nil {
-		if errors.Is(err, configsecret.ErrNotLegacyFormat) {
+		if errors.Is(err, configsecret.ErrNotLegacyFormat) || errors.Is(err, configsecret.ErrNotEra74Format) {
 			fmt.Printf("[-] %v\n", err)
 			return nil
 		}

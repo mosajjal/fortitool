@@ -180,3 +180,48 @@ func TestFindSeedMaterialNotFound(t *testing.T) {
 		t.Fatal("expected no seed material to be found in random data")
 	}
 }
+
+// TestDecryptRootfs_ChaCha20Body covers the 7.4.1-7.4.3 era: the body is
+// ChaCha20-encrypted with key/IV derived by rotated-SHA256 of the seed
+// (Optistream fortigate-crypto scheme: key = SHA256(seed[4:]+seed[:4]),
+// iv = SHA256(seed[5:]+seed[:5])), rather than AES-CTR from the signature.
+func TestDecryptRootfs_ChaCha20Body(t *testing.T) {
+	key := genTestRSAKey(t)
+
+	seed := make([]byte, seedLen)
+	rand.Read(seed)
+	// RSA key obfuscated with a different split than the body derivation,
+	// as observed on real builds
+	encBlob := chacha20Decrypt(seed, 2, 3, key.der)
+
+	kernelPayload := make([]byte, 4096)
+	rand.Read(kernelPayload)
+	copy(kernelPayload[512:512+seedLen], seed)
+	copy(kernelPayload[512+seedLen:], encBlob)
+
+	wantPlaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("rootfs-cpio-data"), 50)...)
+
+	// body cipher: key split 4, iv split 5 (the fortigate-crypto finding)
+	body := chacha20Decrypt(seed, 4, 5, wantPlaintext)
+
+	hash := sha256.Sum256(body)
+	payload := hash[:] // era-appropriate: signature carries just the hash
+	modLen := (key.priv.N.BitLen() + 7) / 8
+	m := pkcs1Wrap(payload, modLen)
+	sig := signAsRSAPublicOp(m, key.priv)
+
+	rootfsGz := append(body, sig...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := DecryptRootfs(ctx, kernelPayload, rootfsGz)
+	if err != nil {
+		t.Fatalf("DecryptRootfs: %v", err)
+	}
+	if !bytes.Equal(res.Plaintext, wantPlaintext) {
+		t.Fatalf("plaintext mismatch: got %d bytes", len(res.Plaintext))
+	}
+	if res.Cipher != "chacha20" {
+		t.Fatalf("cipher = %q, want chacha20", res.Cipher)
+	}
+}

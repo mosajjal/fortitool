@@ -76,90 +76,24 @@ func makePadding(n int) []byte {
 	return p
 }
 
-func TestDecryptEra74WrongKeyRejected(t *testing.T) {
-	// A marker blob whose ciphertext was produced under the WRONG key
-	// (legacy AES-128 here) must not silently "decrypt" -- it should fall
-	// through both era-7.4 layout checks to ErrNotLegacyFormat.
+func TestDecryptLegacyEra74Marker(t *testing.T) {
 	buf := make([]byte, certPasswordCiphertextLen)
-	copy(buf, []byte("encrypted-under-the-legacy-key-but-marked-as-era-7.4"))
-	b64, _ := encryptLegacyForTest(t, buf)
+	copy(buf, []byte("some-secret-encrypted-under-the-unidentified-post-7.4-key"))
+	b64, ivPrefix := encryptLegacyForTest(t, buf)
 
+	// The marker is appended AFTER encryption, unencrypted -- reconstruct
+	// that shape directly rather than via encryptLegacyForTest.
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = ivPrefix
 	withMarker := append(raw, era74Marker...)
-	_, err = DecryptLegacy(base64.StdEncoding.EncodeToString(withMarker))
-	if !errors.Is(err, ErrNotLegacyFormat) {
-		t.Fatalf("got err=%v, want ErrNotLegacyFormat", err)
-	}
-}
+	b64WithMarker := base64.StdEncoding.EncodeToString(withMarker)
 
-func TestDecryptEra74CertFixed144(t *testing.T) {
-	// >=7.4 (build 2731) era: AES-256-CBC under the new hardcoded key,
-	// same 4-byte IV prefix, fixed 144-byte zero-padded buffer, and the
-	// unencrypted 8-byte marker appended after the ciphertext.
-	secret := []byte("464608dd30a23635d7b889a246163f4c3cd29b4d33f7eca8ff4d11895c9f95")
-	buf := make([]byte, certPasswordCiphertextLen)
-	copy(buf, secret)
-
-	ivPrefix := make([]byte, 4)
-	if _, err := rand.Read(ivPrefix); err != nil {
-		t.Fatal(err)
-	}
-	iv := make([]byte, 16)
-	copy(iv[:4], ivPrefix)
-	block, err := aes.NewCipher(era74Key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := make([]byte, len(buf))
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, buf)
-
-	raw := append(append([]byte{}, ivPrefix...), out...)
-	raw = append(raw, era74Marker...)
-	res, err := DecryptLegacy(base64.StdEncoding.EncodeToString(raw))
-	if err != nil {
-		t.Fatalf("DecryptLegacy (era-7.4 blob): %v", err)
-	}
-	if string(res.Secret) != string(secret) {
-		t.Fatalf("got %q want %q", res.Secret, secret)
-	}
-	if res.Layout != LayoutCertFixed144 {
-		t.Fatalf("layout = %q, want %q", res.Layout, LayoutCertFixed144)
-	}
-}
-
-func TestDecryptEra74PKCS7Variable(t *testing.T) {
-	// Real-world shape observed for short admin passwords in >=7.4
-	// backups (e.g. the factory 'guest' default admin).
-	secret := []byte("guest")
-	padded := append(append([]byte{}, secret...), makePadding(aes.BlockSize-len(secret)%aes.BlockSize)...)
-
-	ivPrefix := make([]byte, 4)
-	if _, err := rand.Read(ivPrefix); err != nil {
-		t.Fatal(err)
-	}
-	iv := make([]byte, 16)
-	copy(iv[:4], ivPrefix)
-	block, err := aes.NewCipher(era74Key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := make([]byte, len(padded))
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, padded)
-
-	raw := append(append([]byte{}, ivPrefix...), out...)
-	raw = append(raw, era74Marker...)
-	res, err := DecryptLegacy(base64.StdEncoding.EncodeToString(raw))
-	if err != nil {
-		t.Fatalf("DecryptLegacy (era-7.4 blob): %v", err)
-	}
-	if string(res.Secret) != string(secret) {
-		t.Fatalf("got %q want %q", res.Secret, secret)
-	}
-	if res.Layout != LayoutPKCS7Variable {
-		t.Fatalf("layout = %q, want %q", res.Layout, LayoutPKCS7Variable)
+	_, err = DecryptLegacy(b64WithMarker)
+	if !errors.Is(err, ErrEra74Unidentified) {
+		t.Fatalf("got err=%v, want ErrEra74Unidentified", err)
 	}
 }
 
@@ -180,5 +114,98 @@ func TestDecryptLegacyWrongKeyDetected(t *testing.T) {
 func TestDecryptLegacyBadBase64(t *testing.T) {
 	if _, err := DecryptLegacy("not-valid-base64!!!"); err == nil {
 		t.Fatal("expected an error for invalid base64")
+	}
+}
+
+func encryptEra74ForTest(t *testing.T, ct []byte) string {
+	t.Helper()
+	ivPrefix := make([]byte, 4)
+	if _, err := rand.Read(ivPrefix); err != nil {
+		t.Fatal(err)
+	}
+	iv := make([]byte, 16)
+	copy(iv[:4], ivPrefix)
+
+	block, err := aes.NewCipher(era74Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]byte, len(ct))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, ct)
+	raw := append(append(ivPrefix, out...), era74Marker...)
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// TestDecryptEra74CertFixed144 exercises the >=7.4 (build 2731) AES-256
+// path with the recovered key, in the fixed-144 cert-password layout that
+// was validated against all 26 real new-format blobs.
+func TestDecryptEra74CertFixed144(t *testing.T) {
+	secret := []byte("feedface0011223344556677889900aabbccddeeff00112233445566778899")
+	buf := make([]byte, certPasswordCiphertextLen)
+	copy(buf, secret)
+
+	b64 := encryptEra74ForTest(t, buf)
+	res, err := Decrypt(b64)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(res.Secret) != string(secret) {
+		t.Fatalf("got %q want %q", res.Secret, secret)
+	}
+	if res.Layout != LayoutCertFixed144 {
+		t.Fatalf("layout = %q, want %q", res.Layout, LayoutCertFixed144)
+	}
+}
+
+// TestDecryptEra74PKCS7Variable covers the short admin-password shape
+// under the new key.
+func TestDecryptEra74PKCS7Variable(t *testing.T) {
+	secret := []byte("guest")
+	padded := append(append([]byte{}, secret...), makePadding(aes.BlockSize-len(secret)%aes.BlockSize)...)
+
+	b64 := encryptEra74ForTest(t, padded)
+	res, err := Decrypt(b64)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(res.Secret) != string(secret) {
+		t.Fatalf("got %q want %q", res.Secret, secret)
+	}
+	if res.Layout != LayoutPKCS7Variable {
+		t.Fatalf("layout = %q, want %q", res.Layout, LayoutPKCS7Variable)
+	}
+}
+
+// TestDecryptAutoDetectsLegacy makes sure the era-dispatching entry point
+// still routes pre-7.4 blobs to the legacy key.
+func TestDecryptAutoDetectsLegacy(t *testing.T) {
+	buf := make([]byte, certPasswordCiphertextLen)
+	copy(buf, []byte("abc123"))
+	b64, _ := encryptLegacyForTest(t, buf)
+
+	res, err := Decrypt(b64)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if string(res.Secret) != "abc123" {
+		t.Fatalf("got %q", res.Secret)
+	}
+}
+
+// TestDecryptEra74RejectsNonMarker checks the explicit-era entry point
+// refuses blobs without the trailer.
+func TestDecryptEra74RejectsNonMarker(t *testing.T) {
+	buf := make([]byte, certPasswordCiphertextLen)
+	b64, _ := encryptLegacyForTest(t, buf)
+	if _, err := DecryptEra74(b64); err == nil {
+		t.Fatal("expected error for a blob without the era marker")
+	}
+}
+
+// TestEra74KeyShape pins the recovered key's length -- a silent truncation
+// here would fail as implausible-plaintext rather than a key error.
+func TestEra74KeyShape(t *testing.T) {
+	if len(era74Key) != 32 {
+		t.Fatalf("era74Key length = %d, want 32 (AES-256)", len(era74Key))
 	}
 }

@@ -7,7 +7,23 @@ import (
 	"fmt"
 )
 
-var gzipMagic = []byte{0x1f, 0x8b}
+var (
+	gzipMagic = []byte{0x1f, 0x8b}
+	xzMagic   = []byte("\xfd7zXZ\x00")
+)
+
+// plausibleBody reports whether b starts like a compressed stream we can
+// handle downstream. FortiOS <= 7.6 rootfs bodies are gzip; FortiOS 8.0
+// VM images carry an xz-compressed ext4 rootfs instead.
+func plausibleBody(b []byte) bool {
+	if len(b) < 6 {
+		return false
+	}
+	if b[0] == gzipMagic[0] && b[1] == gzipMagic[1] {
+		return true
+	}
+	return bytes.Equal(b[:6], xzMagic)
+}
 
 // Result carries everything the caller might want to log/verify about a
 // successful rootfs decryption.
@@ -48,12 +64,49 @@ func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result
 		r.Seed = sm
 		return r, nil
 	}
+	if r := tryChaCha20Body(sm, body, bodyHash[:]); r != nil {
+		r.Seed = sm
+		return r, nil
+	}
 	if r := tryStreamCiphers(payload, body, bodyHash[:]); r != nil {
 		r.Seed = sm
 		return r, nil
 	}
 
-	return nil, fmt.Errorf("recovered RSA key (family=%s) but no known body cipher (AES-CTR / FORT-RC4 / modified-RC4) produced a valid gzip stream", sm.Family)
+	return nil, fmt.Errorf("recovered RSA key (family=%s) but no known body cipher (AES-CTR / ChaCha20 / FORT-RC4 / modified-RC4) produced a valid gzip stream", sm.Family)
+}
+
+// tryChaCha20Body handles the 7.4.1-7.4.3 era (Bishop Fox "Further
+// Adventures", Optistream fortigate-crypto): the rootfs body itself is
+// ChaCha20-encrypted with key = SHA256(rot_k(seed)) and 16-byte IV =
+// SHA256(rot_i(seed)), the counter being the first IV word (Fortinet's
+// non-RFC7539 layout). The exact rotation split varies by build, so every
+// known split is tried against a probe until the gzip/xz magic appears.
+func tryChaCha20Body(sm *SeedMaterial, body, bodyHash []byte) *Result {
+	probeLen := 64
+	if probeLen > len(body) {
+		probeLen = len(body)
+	}
+	for _, split := range chachaSplits {
+		ks := chacha20Keystream(sm.Seed, split[0], split[1], probeLen)
+		probe := make([]byte, probeLen)
+		for i := range probe {
+			probe[i] = body[i] ^ ks[i]
+		}
+		if !plausibleBody(probe) {
+			continue
+		}
+		full := chacha20Decrypt(sm.Seed, split[0], split[1], body)
+		// In this era the body hash inside the RSA payload is BER-encoded,
+		// so a raw byte comparison isn't possible; HashOK stays false and
+		// the gzip/xz magic + downstream decompression are the checks.
+		return &Result{
+			Plaintext: full, Cipher: "chacha20", HashOK: false,
+			KeyDetail: fmt.Sprintf("body-key-split=%d body-iv-split=%d seed=%x",
+				split[0], split[1], sm.Seed),
+		}
+	}
+	return nil
 }
 
 // tryAESCTR handles the two known field orderings of the AES-CTR signature
@@ -77,7 +130,7 @@ func tryAESCTR(payload, body, bodyHash []byte) *Result {
 		nonce := l.ctr[:8]
 		counter0 := getLE64(l.ctr[8:16])
 		plain := aesCustomCTR(l.aeskey, nonce, counter0, step, body)
-		if len(plain) >= 2 && plain[0] == gzipMagic[0] && plain[1] == gzipMagic[1] {
+		if plausibleBody(plain) {
 			return &Result{
 				Plaintext: plain, Cipher: "aes-ctr", HashOK: hashOK,
 				KeyDetail: fmt.Sprintf("layout=%s aes_key=%x", l.name, l.aeskey),
@@ -118,7 +171,7 @@ func tryStreamCiphers(payload, body, bodyHash []byte) *Result {
 
 	for _, c := range candidates {
 		out := c.fn(key, probe)
-		if len(out) >= 2 && out[0] == gzipMagic[0] && out[1] == gzipMagic[1] {
+		if plausibleBody(out) {
 			full := c.fn(key, body)
 			cipherName := "fort-rc4"
 			if c.name[0] == 'm' {
