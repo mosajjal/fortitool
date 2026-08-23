@@ -59,7 +59,7 @@ func modifiedRC4(key, data []byte, keepJ bool) []byte {
 		s[i], s[j] = s[j], s[i]
 	}
 
-	const w14 = 0xFFFFFFAA
+	const w14 uint32 = 0xFFFFFFAA
 	i := 0
 	if !keepJ {
 		j = 0
@@ -89,7 +89,7 @@ func modifiedRC4(key, data []byte, keepJ bool) []byte {
 		t := (int(si) + int(sj)) & 0xFF
 		u := (int(sj) + j) & 0xFF
 
-		v1 := ((int(s[iRot]) + int(s[jRot])) ^ w14) & 0xFF
+		v1 := int(((uint32(s[iRot]) + uint32(s[jRot])) ^ w14) & 0xFF)
 		v2 := ((int(s[v1]) + int(s[t])) ^ int(s[u]) ^ int(ct)) & 0xFF
 		out[pos] = byte(v2)
 	}
