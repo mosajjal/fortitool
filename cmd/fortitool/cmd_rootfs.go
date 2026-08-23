@@ -53,17 +53,18 @@ EXIT CODES
   0  decrypted (or was already plain gzip -- check stdout for which)
   1  no seed/RSA-key material found, or none of the known body ciphers
      produced valid output -- likely an unsupported crypto era
+  2  invalid flags or wrong number of positional arguments
 `)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		return err
+		return usage(err)
 	}
-	if fs.NArg() < 2 {
+	if fs.NArg() != 2 {
 		fs.Usage()
-		return fmt.Errorf("missing required arguments: <flatkc> <rootfs.gz>")
+		return usagef("usage: fortitool rootfs [-o FILE] <flatkc> <rootfs.gz>")
 	}
 
 	flatkc, err := os.ReadFile(fs.Arg(0))

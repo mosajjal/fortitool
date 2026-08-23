@@ -47,6 +47,11 @@ SUBCOMMANDS
 EXAMPLES
   fortitool pkg scan firmware/work/v7411/fs/datafs
   fortitool pkg inspect --content lib/libips.so.new lib/libips.so.new.x
+
+EXIT CODES
+  0  inspection or scan succeeded
+  1  input could not be read, parsed, scanned, or cryptographically verified
+  2  invalid flags, unknown subcommand, or wrong number of arguments
 `
 
 func cmdPkg(_ context.Context, args []string) error {
@@ -56,7 +61,7 @@ func cmdPkg(_ context.Context, args []string) error {
 	}
 	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, pkgHelp)
-		return fmt.Errorf("usage: fortitool pkg <inspect|scan> ...")
+		return usagef("usage: fortitool pkg <inspect|scan> ...")
 	}
 	switch args[0] {
 	case "inspect":
@@ -65,7 +70,7 @@ func cmdPkg(_ context.Context, args []string) error {
 		return cmdPkgScan(args[1:])
 	default:
 		fmt.Fprint(os.Stderr, pkgHelp)
-		return fmt.Errorf("usage: fortitool pkg <inspect|scan> ...")
+		return usagef("usage: fortitool pkg <inspect|scan> ...")
 	}
 }
 
@@ -77,11 +82,11 @@ func cmdPkgInspect(args []string) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		return err
+		return usage(err)
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return fmt.Errorf("usage: fortitool pkg inspect [--content <payload>] <sig.x>")
+		return usagef("usage: fortitool pkg inspect [--content <payload>] <sig.x>")
 	}
 	contentSet := false
 	fs.Visit(func(f *flag.Flag) {
@@ -170,7 +175,7 @@ func cmdPkgScan(args []string) error {
 	}
 	if len(args) != 1 {
 		fmt.Fprint(os.Stderr, pkgHelp)
-		return fmt.Errorf("usage: fortitool pkg scan <dir>")
+		return usagef("usage: fortitool pkg scan <dir>")
 	}
 	root := args[0]
 	scan, err := scanPackageFiles(root, filepath.WalkDir)

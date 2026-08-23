@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 
@@ -45,6 +46,7 @@ EXIT CODES
   0  decrypted (secret printed), OR an unrecognized field type (neither
      known layout matched) -- check stdout for which
   1  malformed input (bad base64, too short to contain an IV)
+  2  invalid flags, unknown subcommand, or wrong number of arguments
 `
 
 func cmdConfig(_ context.Context, args []string) error {
@@ -52,11 +54,31 @@ func cmdConfig(_ context.Context, args []string) error {
 		fmt.Fprint(os.Stderr, configHelp)
 		return nil
 	}
-	if len(args) < 2 || args[0] != "decrypt" {
+	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, configHelp)
-		return fmt.Errorf("usage: fortitool config decrypt <base64-blob>")
+		return usagef("usage: fortitool config decrypt <base64-blob>")
 	}
-	res, err := configsecret.Decrypt(args[1])
+	if args[0] != "decrypt" {
+		fmt.Fprint(os.Stderr, configHelp)
+		return usagef("usage: fortitool config decrypt <base64-blob>")
+	}
+	return cmdConfigDecrypt(args[1:])
+}
+
+func cmdConfigDecrypt(args []string) error {
+	fs := flag.NewFlagSet("config decrypt", flag.ContinueOnError)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, configHelp) }
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return usage(err)
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return usagef("usage: fortitool config decrypt <base64-blob>")
+	}
+	res, err := configsecret.Decrypt(fs.Arg(0))
 	if err != nil {
 		if errors.Is(err, configsecret.ErrNotLegacyFormat) || errors.Is(err, configsecret.ErrNotEra74Format) {
 			fmt.Printf("[-] %v\n", err)

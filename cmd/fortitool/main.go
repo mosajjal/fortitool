@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -36,36 +37,40 @@ var commands = []command{
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	os.Exit(runCLI(context.Background(), os.Args[1:]))
+}
+
+func runCLI(ctx context.Context, args []string) int {
+	if len(args) < 1 {
 		printTopLevelHelp(os.Stdout)
-		os.Exit(2)
+		return 2
 	}
-	cmd := os.Args[1]
-	args := os.Args[2:]
+	cmd := args[0]
+	cmdArgs := args[1:]
 
 	if cmd == "-h" || cmd == "--help" || cmd == "help" {
 		printTopLevelHelp(os.Stdout)
-		return
+		return 0
 	}
 	if cmd == "--version" || cmd == "version" {
 		fmt.Println("fortitool", version)
-		return
+		return 0
 	}
 
 	for _, c := range commands {
 		if c.name != cmd {
 			continue
 		}
-		if err := c.run(context.Background(), args); err != nil {
+		if err := c.run(ctx, cmdArgs); err != nil {
 			fmt.Fprintf(os.Stderr, "[-] %v\n", err)
-			os.Exit(commandExitCode(err))
+			return commandExitCode(err)
 		}
-		return
+		return 0
 	}
 
 	fmt.Fprintf(os.Stderr, "fortitool: unknown command %q\n\n", cmd)
 	printTopLevelHelp(os.Stderr)
-	os.Exit(2)
+	return 2
 }
 
 type usageError struct {
@@ -80,8 +85,12 @@ func (e *usageError) Unwrap() error {
 	return e.err
 }
 
+func usage(err error) error {
+	return &usageError{err: err}
+}
+
 func usagef(format string, args ...any) error {
-	return &usageError{err: fmt.Errorf(format, args...)}
+	return usage(fmt.Errorf(format, args...))
 }
 
 func commandExitCode(err error) int {
@@ -92,7 +101,7 @@ func commandExitCode(err error) int {
 	return 1
 }
 
-func printTopLevelHelp(w *os.File) {
+func printTopLevelHelp(w io.Writer) {
 	fmt.Fprintf(w, `fortitool %s -- FortiOS firmware decryption/unpacking, one static binary, no OS deps
 
 WHAT THIS IS

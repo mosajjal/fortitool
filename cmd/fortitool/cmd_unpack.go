@@ -36,17 +36,22 @@ FLAGS
 EXAMPLES
   fortitool unpack -o rootfs/ rootfs.gz.dec
   fortitool unpack -o rootfs/bin rootfs/bin.tar.xz
+
+EXIT CODES
+  0  archive unpacked successfully
+  1  input could not be read or extracted
+  2  invalid flags, missing -o, or wrong number of positional arguments
 `)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		return err
+		return usage(err)
 	}
-	if fs.NArg() < 1 || *out == "" {
+	if fs.NArg() != 1 || *out == "" {
 		fs.Usage()
-		return fmt.Errorf("missing required argument or -o flag")
+		return usagef("usage: fortitool unpack -o OUTDIR <archive>")
 	}
 	data, err := os.ReadFile(fs.Arg(0))
 	if err != nil {
