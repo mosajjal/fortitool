@@ -226,6 +226,9 @@ func DeriveKey(ctx context.Context, data []byte) []byte {
 // Decrypt decrypts an entire image using a recovered 32-byte key, one
 // 512-byte block at a time, in parallel.
 func Decrypt(data, key []byte) []byte {
+	if len(key) != 32 {
+		return nil
+	}
 	numBlocks := (len(data) + BlockSize - 1) / BlockSize
 	out := make([]byte, len(data))
 	workers := runtime.NumCPU()

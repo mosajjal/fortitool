@@ -3,6 +3,7 @@ package l1
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -103,5 +104,16 @@ func TestDecryptAutoNoKeyFound(t *testing.T) {
 	_, _, _, ok := DecryptAuto(ctx, junk)
 	if ok {
 		t.Fatal("expected no key to be found in random data")
+	}
+}
+
+func TestDecryptRejectsInvalidKeyLengths(t *testing.T) {
+	data := make([]byte, BlockSize)
+	for _, n := range []int{0, 31, 33} {
+		t.Run(fmt.Sprintf("length_%d", n), func(t *testing.T) {
+			if got := Decrypt(data, make([]byte, n)); got != nil {
+				t.Fatalf("Decrypt returned %d bytes for a %d-byte key", len(got), n)
+			}
+		})
 	}
 }
