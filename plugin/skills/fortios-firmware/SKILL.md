@@ -26,7 +26,7 @@ or build from source (`git clone https://github.com/mosajjal/fortitool && cd for
 | `fortitool rootfs -o out.gz flatkc rootfs.gz` | rootfs.gz crypto layer only |
 | `fortitool unpack -o outdir archive` | Generic gzip+tar / xz+tar extraction |
 | `fortitool pkg scan datafs/` | Classify files in a directory, find PKCS#7 signatures |
-| `fortitool pkg inspect sig.x --content payload` | Verify a detached PKCS#7 signature |
+| `fortitool pkg inspect --content payload sig.x` | Verify every signer in a detached PKCS#7 signature (integrity only; no trust-chain validation) |
 | `fortitool config decrypt <base64-blob>` | Decrypt a config-backup `ENC` secret |
 
 Every crypto layer auto-detects its era/scheme (no version or CPU
