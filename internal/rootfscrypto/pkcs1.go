@@ -15,6 +15,9 @@ func pkcs1Unwrap(m []byte) ([]byte, error) {
 	for i < len(m) && m[i] == 0xFF {
 		i++
 	}
+	if i-2 < 8 {
+		return nil, errors.New("PKCS#1 Type-1 padding is shorter than 8 bytes")
+	}
 	if i >= len(m) || m[i] != 0x00 {
 		return nil, errors.New("missing PKCS#1 padding terminator")
 	}

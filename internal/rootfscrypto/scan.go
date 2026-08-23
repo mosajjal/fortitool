@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"runtime"
+	"sort"
 	"sync"
 
 	"golang.org/x/crypto/chacha20"
@@ -114,58 +115,56 @@ func validDER(der []byte) bool {
 }
 
 func lowEntropySeed(seed []byte) bool {
-	seen := map[byte]bool{}
+	var seen [256]bool
+	count := 0
 	for _, b := range seed {
-		seen[b] = true
+		if !seen[b] {
+			seen[b] = true
+			count++
+			if count >= 8 {
+				return false
+			}
+		}
 	}
-	return len(seen) < 8
+	return true
 }
 
 // scanXORFamily tries the 7.6.x/8.0-style obfuscation: seed contiguous with
 // blob, or seed within 512 bytes of blob (RSA-key-first layout, as in
 // forticrack_v8's fixed x86_64 offsets and fgx's aarch64 near-contiguous
 // case).
-func scanXORFamily(data []byte) *SeedMaterial {
-	// Pass 1: contiguous seed(32) + blob(270)
-	for off := 0; off+seedLen+blobLen <= len(data); off++ {
-		seed := data[off : off+seedLen]
-		if lowEntropySeed(seed) {
-			continue
-		}
-		enc := data[off+seedLen : off+seedLen+blobLen]
-		if enc[0]^seed[0] != derPrefix8[0] || enc[1]^seed[1] != derPrefix8[1] {
-			continue
-		}
-		der := xorDecrypt32(seed, enc)
-		if !validDER(der) {
-			continue
-		}
-		key, err := parsePKCS1PublicKey(der)
-		if err != nil {
-			continue
-		}
-		return &SeedMaterial{
-			Seed: append([]byte(nil), seed...), SeedOffset: off,
-			BlobOffset: off + seedLen, Family: "xor", DER: der, Key: key,
-		}
-	}
-
-	// Pass 2: near-contiguous, blob (RSA key) precedes seed within 512 bytes
-	// (forticrack_v8's x86_64 8.0 layout: RSA_ENC_VA < XOR_KEY_VA, gap 0x120).
+func scanXORFamily(ctx context.Context, data []byte) []*SeedMaterial {
 	idx := map[[2]byte][]int{}
 	for off := 0; off+blobLen <= len(data); off++ {
+		if off&0xfff == 0 {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		}
 		k := [2]byte{data[off], data[off+1]}
 		idx[k] = append(idx[k], off)
 	}
+	var found []*SeedMaterial
 	for off := 0; off+seedLen <= len(data); off++ {
+		if off&0xfff == 0 {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		}
 		seed := data[off : off+seedLen]
 		if lowEntropySeed(seed) {
 			continue
 		}
 		want := [2]byte{seed[0] ^ derPrefix8[0], seed[1] ^ derPrefix8[1]}
-		for _, blobOff := range idx[want] {
-			if blobOff == off+seedLen {
-				continue // already covered by pass 1
+		blobOffsets := idx[want]
+		start := sort.SearchInts(blobOffsets, off-512)
+		for _, blobOff := range blobOffsets[start:] {
+			if blobOff > off+512 {
+				break
 			}
 			dist := blobOff - off
 			if dist < 0 {
@@ -183,13 +182,13 @@ func scanXORFamily(data []byte) *SeedMaterial {
 			if err != nil {
 				continue
 			}
-			return &SeedMaterial{
+			found = append(found, &SeedMaterial{
 				Seed: append([]byte(nil), seed...), SeedOffset: off,
 				BlobOffset: blobOff, Family: "xor", DER: der, Key: key,
-			}
+			})
 		}
 	}
-	return nil
+	return found
 }
 
 // scanChaChaFamily locates a contiguous seed(32)+blob(270) pair whose blob
@@ -198,13 +197,20 @@ func scanXORFamily(data []byte) *SeedMaterial {
 // 8-byte ChaCha20 keystream prefix a correct seed would need to produce,
 // then scans seed candidates for a match (same trick as this repo's
 // fwf_find_crypto_material.py, generalized across all known splits).
-func scanChaChaFamily(ctx context.Context, data []byte) *SeedMaterial {
+func scanChaChaFamily(ctx context.Context, data []byte) []*SeedMaterial {
 	if len(data) < blobLen {
 		return nil
 	}
 	type winKey [8]byte
 	wanted := map[winKey][]int{}
 	for off := 0; off+blobLen <= len(data); off += 4 {
+		if off&0xfff == 0 {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		}
 		var k winKey
 		for i := 0; i < 8; i++ {
 			k[i] = data[off+i] ^ derPrefix8[i]
@@ -221,10 +227,7 @@ func scanChaChaFamily(ctx context.Context, data []byte) *SeedMaterial {
 	if workers < 1 {
 		workers = 1
 	}
-	subCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	result := make(chan *SeedMaterial, 1)
+	result := make(chan *SeedMaterial)
 	var wg sync.WaitGroup
 	chunk := (numSeedOffsets + workers - 1) / workers
 
@@ -242,7 +245,7 @@ func scanChaChaFamily(ctx context.Context, data []byte) *SeedMaterial {
 			defer wg.Done()
 			for i := startIdx; i < endIdx; i++ {
 				select {
-				case <-subCtx.Done():
+				case <-ctx.Done():
 					return
 				default:
 				}
@@ -275,10 +278,9 @@ func scanChaChaFamily(ctx context.Context, data []byte) *SeedMaterial {
 						}
 						select {
 						case result <- sm:
-							cancel()
-						default:
+						case <-ctx.Done():
+							return
 						}
-						return
 					}
 				}
 			}
@@ -289,15 +291,38 @@ func scanChaChaFamily(ctx context.Context, data []byte) *SeedMaterial {
 		wg.Wait()
 		close(result)
 	}()
-	return <-result
+	var found []*SeedMaterial
+	for sm := range result {
+		found = append(found, sm)
+	}
+	sortSeedMaterials(found)
+	return found
 }
 
-// FindSeedMaterial runs both scan families (XOR fast path first, since it's
-// cheap; ChaCha20 fallback covers 7.4.x) and returns whichever locates valid
-// crypto material in the given kernel payload.
-func FindSeedMaterial(ctx context.Context, kernelPayload []byte) *SeedMaterial {
-	if sm := scanXORFamily(kernelPayload); sm != nil {
-		return sm
+// FindSeedMaterials returns every structurally valid candidate from the
+// applicable obfuscation family in deterministic offset order.
+func FindSeedMaterials(ctx context.Context, kernelPayload []byte) []*SeedMaterial {
+	if candidates := scanXORFamily(ctx, kernelPayload); len(candidates) != 0 {
+		sortSeedMaterials(candidates)
+		return candidates
+	}
+	if ctx.Err() != nil {
+		return nil
 	}
 	return scanChaChaFamily(ctx, kernelPayload)
+}
+
+func sortSeedMaterials(materials []*SeedMaterial) {
+	sort.Slice(materials, func(i, j int) bool {
+		if materials[i].SeedOffset != materials[j].SeedOffset {
+			return materials[i].SeedOffset < materials[j].SeedOffset
+		}
+		if materials[i].BlobOffset != materials[j].BlobOffset {
+			return materials[i].BlobOffset < materials[j].BlobOffset
+		}
+		if materials[i].KeySplit != materials[j].KeySplit {
+			return materials[i].KeySplit < materials[j].KeySplit
+		}
+		return materials[i].IVSplit < materials[j].IVSplit
+	})
 }
