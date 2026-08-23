@@ -11,6 +11,18 @@ import (
 
 const testClusterBits = 16 // 64 KiB clusters
 
+type fullReadEOFReader struct {
+	r io.ReaderAt
+}
+
+func (r fullReadEOFReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.r.ReadAt(p, off)
+	if n == len(p) {
+		return n, io.EOF
+	}
+	return n, err
+}
+
 func buildHeader(t *testing.T, virtualSize uint64, l1Size uint32, l1Off uint64) []byte {
 	t.Helper()
 	hdr := make([]byte, 104)
@@ -161,6 +173,24 @@ func TestReadUncompressedAndHoles(t *testing.T) {
 		if span[i] != c1[clusterSize-64+uint64(i)] {
 			t.Fatal("spanning read first half mismatch")
 		}
+	}
+}
+
+func TestFullReadWithEOFAccepted(t *testing.T) {
+	clusterSize := uint64(1) << testClusterBits
+	want := bytes.Repeat([]byte{0x5a}, int(clusterSize))
+	img := buildImage(t, clusterSize, map[uint64][]byte{0: want})
+
+	rd, err := Open(fullReadEOFReader{r: bytes.NewReader(img)})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got := make([]byte, clusterSize)
+	if n, err := rd.ReadAt(got, 0); n != len(got) || err != nil {
+		t.Fatalf("ReadAt: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("cluster mismatch")
 	}
 }
 

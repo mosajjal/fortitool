@@ -49,10 +49,21 @@ func IsQCow2(data []byte) bool {
 	return len(data) >= 4 && bytes.Equal(data[:4], magic[:])
 }
 
+func readFullAt(r io.ReaderAt, p []byte, off int64) error {
+	n, err := r.ReadAt(p, off)
+	if n == len(p) && (err == nil || err == io.EOF) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return io.ErrUnexpectedEOF
+}
+
 // Open parses the qcow2 header and L1 table from r.
 func Open(r io.ReaderAt) (*Reader, error) {
 	hdr := make([]byte, 104)
-	if _, err := r.ReadAt(hdr, 0); err != nil {
+	if err := readFullAt(r, hdr, 0); err != nil {
 		return nil, fmt.Errorf("qcow2: reading header: %w", err)
 	}
 	if !bytes.Equal(hdr[0:4], magic[:]) {
@@ -100,7 +111,7 @@ func Open(r io.ReaderAt) (*Reader, error) {
 	}
 
 	buf := make([]byte, int(l1Size)*8)
-	if _, err := r.ReadAt(buf, int64(l1Off)); err != nil {
+	if err := readFullAt(r, buf, int64(l1Off)); err != nil {
 		return nil, fmt.Errorf("qcow2: reading L1 table (%d entries): %w", l1Size, err)
 	}
 	rd.l1Table = make([]uint64, l1Size)
@@ -124,7 +135,7 @@ func (r *Reader) l2Table(l1Index int) ([]uint64, error) {
 		return nil, nil
 	}
 	buf := make([]byte, r.clusterSize)
-	if _, err := r.r.ReadAt(buf, int64(off)); err != nil {
+	if err := readFullAt(r.r, buf, int64(off)); err != nil {
 		return nil, fmt.Errorf("qcow2: reading L2 table at %d: %w", off, err)
 	}
 	table := make([]uint64, r.l2Size)
@@ -182,7 +193,7 @@ func (r *Reader) clusterData(voff int64) ([]byte, error) {
 	if coffset == 0 {
 		return out, nil
 	}
-	if _, err := r.r.ReadAt(out, int64(coffset)); err != nil {
+	if err := readFullAt(r.r, out, int64(coffset)); err != nil {
 		return nil, fmt.Errorf("qcow2: reading cluster at %d: %w", coffset, err)
 	}
 	return out, nil
