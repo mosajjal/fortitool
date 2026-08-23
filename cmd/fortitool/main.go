@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 )
@@ -57,7 +58,7 @@ func main() {
 		}
 		if err := c.run(context.Background(), args); err != nil {
 			fmt.Fprintf(os.Stderr, "[-] %v\n", err)
-			os.Exit(1)
+			os.Exit(commandExitCode(err))
 		}
 		return
 	}
@@ -65,6 +66,30 @@ func main() {
 	fmt.Fprintf(os.Stderr, "fortitool: unknown command %q\n\n", cmd)
 	printTopLevelHelp(os.Stderr)
 	os.Exit(2)
+}
+
+type usageError struct {
+	err error
+}
+
+func (e *usageError) Error() string {
+	return e.err.Error()
+}
+
+func (e *usageError) Unwrap() error {
+	return e.err
+}
+
+func usagef(format string, args ...any) error {
+	return &usageError{err: fmt.Errorf(format, args...)}
+}
+
+func commandExitCode(err error) int {
+	var usage *usageError
+	if errors.As(err, &usage) {
+		return 2
+	}
+	return 1
 }
 
 func printTopLevelHelp(w *os.File) {

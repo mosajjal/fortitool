@@ -39,7 +39,7 @@ fortitool decrypt -o outdir image.out          # full pipeline, one command
 fortitool l1 -o out.img image.out              # outer XOR layer only
 fortitool rootfs -o out.gz flatkc rootfs.gz    # rootfs crypto layer only
 fortitool unpack -o outdir archive.tar.xz      # generic gzip+tar / xz+tar
-fortitool pkg inspect sig.x --content payload  # verify a PKCS#7 signature
+fortitool pkg inspect --content payload sig.x  # verify a PKCS#7 signature
 fortitool pkg scan datafs/                     # classify files, find sigs
 fortitool config decrypt <base64-blob>         # config-backup ENC secret
 ```
@@ -48,6 +48,12 @@ Every command has a full description, flags, and examples via
 `fortitool <command> -h` (or run `fortitool -h` for the command list).
 Flags must precede positional arguments — Go's `flag` package doesn't
 permute argv the way getopt does.
+
+With `pkg inspect --content`, verification succeeds only when the wrapper
+contains at least one signer and every `SignerInfo` validates against the
+payload. This proves cryptographic integrity using the certificates embedded
+in the PKCS#7 wrapper; it does not validate their trust chains to a trusted
+root CA.
 
 ## Supported firmware
 
