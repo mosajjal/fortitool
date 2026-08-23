@@ -212,7 +212,7 @@ func scanChaChaFamily(ctx context.Context, data []byte) *SeedMaterial {
 		wanted[k] = append(wanted[k], off)
 	}
 
-	numSeedOffsets := (len(data) - seedLen) / 4
+	numSeedOffsets := (len(data)-seedLen)/4 + 1
 	if numSeedOffsets <= 0 {
 		return nil
 	}
