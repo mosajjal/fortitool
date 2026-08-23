@@ -46,15 +46,20 @@ func TestDiskimageOverQCow2(t *testing.T) {
 	copy(rootDir[0:], []byte{
 		2, 0, 0, 0, 12, 0, 1, 2, '.', '.', 0, 0,
 	})
-	ent := func(off int, ino uint32, name string) {
+	ent := func(off int, ino uint32, name string, final bool) int {
+		recLen := (8 + len(name) + 3) &^ 3
+		if final {
+			recLen = len(rootDir) - off
+		}
 		le32(rootDir[off:off+4], ino)
-		le16(rootDir[off+4:off+6], uint16(8+len(name)))
+		le16(rootDir[off+4:off+6], uint16(recLen))
 		rootDir[off+6] = byte(len(name))
 		rootDir[off+7] = 1
 		copy(rootDir[off+8:], name)
+		return off + recLen
 	}
-	ent(12, 3, "flatkc")
-	ent(8+len("flatkc")+12, 4, "rootfs.gz")
+	off := ent(12, 3, "flatkc", false)
+	ent(off, 4, "rootfs.gz", true)
 	copy(block(5), "KERN")
 	copy(block(6), "ROOTFS")
 

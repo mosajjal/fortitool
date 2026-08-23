@@ -3,6 +3,8 @@ package diskimage
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -96,8 +98,14 @@ func buildExtentFS(t *testing.T) []byte {
 	writeDirBlock := func(blockNum int, entries []dirEnt) {
 		buf := block(blockNum)
 		off := 0
-		for _, e := range entries {
-			recLen := 8 + len(e.name)
+		for i, e := range entries {
+			recLen := (dirEntryHeaderSize + len(e.name) + 3) &^ 3
+			if i == len(entries)-1 {
+				recLen = len(buf) - off
+			}
+			if recLen < dirEntryHeaderSize+len(e.name) || off+recLen > len(buf) {
+				t.Fatal("synthetic directory entries exceed their block")
+			}
 			le32(buf[off:off+4], e.inode)
 			le16(buf[off+4:off+6], uint16(recLen))
 			buf[off+6] = byte(len(e.name))
@@ -167,6 +175,26 @@ func TestReadExtentMappedFile(t *testing.T) {
 		if got[i] != 'C' {
 			t.Fatalf("second extent corrupt at %d", i)
 		}
+	}
+}
+
+func TestReadExtentMappedFilePropagatesBlockReadFailures(t *testing.T) {
+	for _, block := range []int{6, 7} {
+		t.Run(fmt.Sprintf("block-%d", block), func(t *testing.T) {
+			img := buildExtentFS(t)
+			start := int64(block * extBlockSize)
+			fs, err := OpenAt(failingReaderAt{
+				reader:    bytes.NewReader(img),
+				failStart: start,
+				failEnd:   start + extBlockSize,
+			}, int64(len(img)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fs.ReadFile("sparse.data"); !errors.Is(err, errSyntheticBlockRead) {
+				t.Fatalf("ReadFile error = %v, want synthetic block read failure", err)
+			}
+		})
 	}
 }
 

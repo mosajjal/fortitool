@@ -3,6 +3,8 @@ package diskimage
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -108,8 +110,14 @@ func fakeExt2(t *testing.T) []byte {
 	writeDirBlock := func(blockNum int, entries []dirEnt) {
 		buf := block(blockNum)
 		off := 0
-		for _, e := range entries {
-			recLen := 8 + len(e.name)
+		for i, e := range entries {
+			recLen := (dirEntryHeaderSize + len(e.name) + 3) &^ 3
+			if i == len(entries)-1 {
+				recLen = len(buf) - off
+			}
+			if recLen < dirEntryHeaderSize+len(e.name) || off+recLen > len(buf) {
+				t.Fatal("synthetic directory entries exceed their block")
+			}
 			le32(buf[off:off+4], e.inode)
 			le16(buf[off+4:off+6], uint16(recLen))
 			buf[off+6] = byte(len(e.name))
@@ -237,8 +245,8 @@ func TestReadFileNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.ReadFile("does-not-exist.txt"); err == nil {
-		t.Fatal("expected an error for a missing file")
+	if _, err := fs.ReadFile("does-not-exist.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing file error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -246,5 +254,132 @@ func TestOpenRejectsBadMagic(t *testing.T) {
 	junk := make([]byte, 4096)
 	if _, err := Open(junk); err == nil {
 		t.Fatal("expected an error for a non-ext2 image")
+	}
+}
+
+var errSyntheticBlockRead = errors.New("synthetic block read failure")
+
+type failingReaderAt struct {
+	reader    *bytes.Reader
+	failStart int64
+	failEnd   int64
+}
+
+func (r failingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < r.failEnd && off+int64(len(p)) > r.failStart {
+		return 0, errSyntheticBlockRead
+	}
+	return r.reader.ReadAt(p, off)
+}
+
+func openWithBlockReadFailure(t *testing.T, img []byte, block int) *FS {
+	t.Helper()
+	start := int64(block * testBlockSize)
+	fs, err := OpenAt(failingReaderAt{
+		reader:    bytes.NewReader(img),
+		failStart: start,
+		failEnd:   start + testBlockSize,
+	}, int64(len(img)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs
+}
+
+func TestReadFilePropagatesBlockReadFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block int
+		path  string
+	}{
+		{name: "directory data", block: rootDirBlock, path: "small.txt"},
+		{name: "direct data", block: smallFileBlock, path: "small.txt"},
+		{name: "single-indirect table", block: bigFileIndirBlock, path: "big.txt"},
+		{name: "single-indirect data", block: 24, path: "big.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := openWithBlockReadFailure(t, fakeExt2(t), tc.block)
+			if _, err := fs.ReadFile(tc.path); !errors.Is(err, errSyntheticBlockRead) {
+				t.Fatalf("ReadFile error = %v, want synthetic block read failure", err)
+			}
+		})
+	}
+}
+
+func TestReadInodeDataPropagatesDoubleIndirectReadFailures(t *testing.T) {
+	const (
+		doubleTableBlock = 26
+		childTableBlock  = 27
+		doubleDataBlock  = 28
+		totalBlocks      = 300
+	)
+	for _, block := range []int{doubleTableBlock, childTableBlock, doubleDataBlock} {
+		t.Run(fmt.Sprintf("block-%d", block), func(t *testing.T) {
+			base := fakeExt2(t)
+			img := make([]byte, totalBlocks*testBlockSize)
+			copy(img, base)
+			binary.LittleEndian.PutUint32(img[testBlockSize+4:testBlockSize+8], totalBlocks)
+			binary.LittleEndian.PutUint32(img[doubleTableBlock*testBlockSize:doubleTableBlock*testBlockSize+4], childTableBlock)
+			binary.LittleEndian.PutUint32(img[childTableBlock*testBlockSize:childTableBlock*testBlockSize+4], doubleDataBlock)
+
+			fs := openWithBlockReadFailure(t, img, block)
+			in := &inode{sizeLo: uint32((nDirect + testBlockSize/4 + 1) * testBlockSize)}
+			in.block[iBlockDouble] = doubleTableBlock
+			if _, err := fs.readInodeDataIndirect(99, in); !errors.Is(err, errSyntheticBlockRead) {
+				t.Fatalf("readInodeDataIndirect error = %v, want synthetic block read failure", err)
+			}
+		})
+	}
+}
+
+func TestReadFileRejectsBlockOutsideFilesystem(t *testing.T) {
+	img := fakeExt2(t)
+	inodeOff := testInodeTblBlock*testBlockSize + int(inoSmall-1)*128
+	binary.LittleEndian.PutUint32(img[inodeOff+40:inodeOff+44], uint32(len(img)/testBlockSize))
+	fs, err := Open(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.ReadFile("small.txt"); err == nil {
+		t.Fatal("expected an out-of-filesystem block pointer to fail")
+	}
+}
+
+func TestReadFilePreservesExplicitSparseHole(t *testing.T) {
+	img := fakeExt2(t)
+	inodeOff := testInodeTblBlock*testBlockSize + int(inoSmall-1)*128
+	binary.LittleEndian.PutUint32(img[inodeOff+40:inodeOff+44], 0)
+	fs, err := Open(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fs.ReadFile("small.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, make([]byte, len(smallContent))) {
+		t.Fatalf("sparse file data = %x", got)
+	}
+}
+
+func TestReadFileRejectsZeroLengthDirectoryRecord(t *testing.T) {
+	for _, path := range []string{"small.txt", "optional.bin"} {
+		t.Run(path, func(t *testing.T) {
+			img := fakeExt2(t)
+			dir := img[rootDirBlock*testBlockSize : (rootDirBlock+1)*testBlockSize]
+			secondRecord := int(binary.LittleEndian.Uint16(dir[4:6]))
+			binary.LittleEndian.PutUint16(dir[secondRecord+4:secondRecord+6], 0)
+			fs, err := Open(img)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = fs.ReadFile(path)
+			if err == nil {
+				t.Fatal("expected a zero-length directory record to fail")
+			}
+			if errors.Is(err, ErrNotFound) {
+				t.Fatalf("directory corruption was reported as optional absence: %v", err)
+			}
+		})
 	}
 }

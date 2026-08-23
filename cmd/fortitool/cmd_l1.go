@@ -18,19 +18,29 @@ import (
 func gunzipOuter(data []byte) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		// not gzip at all -- some tools pass an already-decompressed image
-		return data, nil
+		// Not gzip at all: some callers pass an already-decompressed image.
+		// If the gzip magic is present, however, a malformed header is fatal.
+		if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
+			return data, nil
+		}
+		return nil, fmt.Errorf("gunzip: %w", err)
 	}
+	defer r.Close()
+	// FortiOS .out files append additional installer data after the first
+	// gzip member. Validate that member, but do not interpret the tail as a
+	// second gzip stream.
+	r.Multistream(false)
 	out, err := io.ReadAll(r)
-	if len(out) > 0 {
-		return out, nil
+	if err != nil {
+		return nil, fmt.Errorf("gunzip: %w", err)
 	}
-	return nil, fmt.Errorf("gunzip: %w", err)
+	return out, nil
 }
 
 func cmdL1(ctx context.Context, args []string) error {
 	fs := newCommandFlagSet("l1", nil)
 	out := fs.String("o", "", "output file (default: <input>.decrypted)")
+	showKeys := fs.Bool("show-keys", false, "print recovered key material")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool l1 -- decrypt the outer FortiOS ".out" firmware container
 
@@ -49,7 +59,8 @@ USAGE
   fortitool l1 [-o FILE] <image.out>
 
 FLAGS
-  -o FILE   output path (default: <image.out>.decrypted)
+  -o FILE      output path (default: <image.out>.decrypted; must not exist)
+  --show-keys  print recovered key material (redacted by default)
 
 EXAMPLES
   fortitool l1 -o image.img FWF_60E-v7.4.11-build2878-FORTINET.out
@@ -57,8 +68,9 @@ EXAMPLES
       -> writes FWF_60E-v7.4.11-build2878-FORTINET.out.decrypted
 
 OUTPUT
-  Prints the recovered 32-byte alphanumeric key (or "already cleartext")
-  to stdout, then writes the decrypted image. The decrypted image still
+  Reports whether a key was recovered (or the image was already cleartext),
+  then writes the decrypted image with private mode 0600. Use --show-keys only
+  in a suitably protected diagnostic session. The decrypted image still
   contains a raw MBR + ext3 volume -- use 'fortitool decrypt' for the full
   pipeline through to an unpacked rootfs, or read the ext3 volume yourself
   starting at byte offset 512.
@@ -102,9 +114,9 @@ EXIT CODES
 	if !wasEncrypted {
 		fmt.Println("[+] image is already cleartext at L1")
 	} else {
-		fmt.Printf("[+] key: %s\n", terminalText(string(key)))
+		fmt.Printf("[+] %s\n", formatRecoveredKey(key, *showKeys))
 	}
-	if err := os.WriteFile(*out, plain, 0o644); err != nil {
+	if err := writeNewFile(*out, plain, 0o600); err != nil {
 		return err
 	}
 	fmt.Printf("[+] wrote %s (%d bytes)\n", terminalText(*out), len(plain))
