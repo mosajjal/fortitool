@@ -48,11 +48,23 @@ func runCLI(ctx context.Context, args []string) int {
 	cmd := args[0]
 	cmdArgs := args[1:]
 
-	if cmd == "-h" || cmd == "--help" || cmd == "help" {
+	if cmd == "-h" || cmd == "--help" {
+		printTopLevelHelp(os.Stdout)
+		return 0
+	}
+	if cmd == "help" {
+		if len(cmdArgs) != 0 {
+			fmt.Fprintln(os.Stderr, "fortitool: usage: fortitool help")
+			return 2
+		}
 		printTopLevelHelp(os.Stdout)
 		return 0
 	}
 	if cmd == "--version" || cmd == "version" {
+		if len(cmdArgs) != 0 {
+			fmt.Fprintln(os.Stderr, "fortitool: usage: fortitool version")
+			return 2
+		}
 		fmt.Println("fortitool", version)
 		return 0
 	}
@@ -62,7 +74,7 @@ func runCLI(ctx context.Context, args []string) int {
 			continue
 		}
 		if err := c.run(ctx, cmdArgs); err != nil {
-			fmt.Fprintf(os.Stderr, "[-] %v\n", err)
+			fmt.Fprintf(os.Stderr, "[-] %s\n", terminalText(err.Error()))
 			return commandExitCode(err)
 		}
 		return 0

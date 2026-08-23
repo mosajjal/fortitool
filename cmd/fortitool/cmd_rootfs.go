@@ -12,7 +12,7 @@ import (
 )
 
 func cmdRootfs(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("rootfs", flag.ContinueOnError)
+	fs := newCommandFlagSet("rootfs", nil)
 	out := fs.String("o", "rootfs.gz.dec", "output file")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool rootfs -- decrypt rootfs.gz, any known FortiOS era, auto-detected
@@ -83,7 +83,7 @@ EXIT CODES
 	if err := os.WriteFile(*out, plain, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("[+] wrote %s (%d bytes)\n", *out, len(plain))
+	fmt.Printf("[+] wrote %s (%d bytes)\n", terminalText(*out), len(plain))
 	return nil
 }
 
@@ -106,7 +106,7 @@ func decryptRootfsAuto(ctx context.Context, flatkc, rootfsGz []byte) ([]byte, er
 		return nil, err
 	}
 	fmt.Printf("[+] seed family=%s cipher=%s hashOK=%v @ kernel offset 0x%x\n",
-		res.Seed.Family, res.Cipher, res.HashOK, res.Seed.SeedOffset)
-	fmt.Printf("    %s\n", res.KeyDetail)
+		terminalText(res.Seed.Family), terminalText(res.Cipher), res.HashOK, res.Seed.SeedOffset)
+	fmt.Printf("    %s\n", terminalText(res.KeyDetail))
 	return res.Plaintext, nil
 }

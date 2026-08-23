@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 
 	"github.com/mosajjal/fortitool/internal/pkcs7"
@@ -75,7 +76,7 @@ func cmdPkg(_ context.Context, args []string) error {
 }
 
 func cmdPkgInspect(args []string) error {
-	fs := flag.NewFlagSet("pkg inspect", flag.ContinueOnError)
+	fs := newCommandFlagSet("pkg inspect", nil)
 	content := fs.String("content", "", "payload file the detached signature covers")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, pkgHelp) }
 	if err := fs.Parse(args); err != nil {
@@ -108,11 +109,11 @@ func cmdPkgInspect(args []string) error {
 	if err != nil {
 		return fmt.Errorf("not a valid PKCS#7 SignedData: %w", err)
 	}
-	fmt.Printf("[+] %s: PKCS#7 SignedData (%d bytes)\n", sigPath, len(der))
+	fmt.Printf("[+] %s: PKCS#7 SignedData (%d bytes)\n", terminalText(sigPath), len(der))
 	fmt.Printf("    digest algorithms: %v\n", sd.DigestAlgorithms)
 	for _, cert := range sd.Certificates {
-		fmt.Printf("    cert: %s\n", cert.Subject)
-		fmt.Printf("          <- %s\n", cert.Issuer)
+		fmt.Printf("    cert: %s\n", terminalText(cert.Subject.String()))
+		fmt.Printf("          <- %s\n", terminalText(cert.Issuer.String()))
 	}
 
 	if !contentSet {
@@ -126,9 +127,10 @@ func cmdPkgInspect(args []string) error {
 	results := pkcs7.VerifyDetached(sd, payload)
 	for i, r := range results {
 		fmt.Printf("[%s] signer %d over %s: digest=%s sig=%s issuer=%s\n",
-			mark(r.Valid), i, *content, r.Signer.DigestAlgorithm, r.Signer.SignatureAlgorithm, r.Signer.IssuerDN)
+			mark(r.Valid), i, terminalText(*content), terminalText(r.Signer.DigestAlgorithm),
+			terminalText(r.Signer.SignatureAlgorithm), terminalText(r.Signer.IssuerDN))
 		if !r.Valid {
-			fmt.Printf("      reason: %s\n", r.Reason)
+			fmt.Printf("      reason: %s\n", terminalText(r.Reason))
 		}
 	}
 	verificationErr := requireAllSignersValid(results)
@@ -185,7 +187,7 @@ func cmdPkgScan(args []string) error {
 	buckets := scan.buckets
 
 	fmt.Printf("Scanned %d regular file%s under %s; skipped %d symlink%s and %d special file%s\n\n",
-		scan.regularFiles, pluralSuffix(scan.regularFiles), root,
+		scan.regularFiles, pluralSuffix(scan.regularFiles), terminalText(root),
 		scan.symlinks, pluralSuffix(scan.symlinks), scan.specialFiles, pluralSuffix(scan.specialFiles))
 
 	kinds := make([]string, 0, len(buckets))
@@ -204,7 +206,7 @@ func cmdPkgScan(args []string) error {
 				fmt.Printf("   ... and %d more\n", len(entries)-12)
 				break
 			}
-			fmt.Printf("   %12d  %s\n", e.size, e.path)
+			fmt.Printf("   %12d  %s\n", e.size, terminalText(e.path))
 		}
 		fmt.Println()
 		if kind == "PKCS#7 SignedData" && firstSig == "" && len(entries) > 0 {
@@ -212,11 +214,15 @@ func cmdPkgScan(args []string) error {
 		}
 	}
 	if firstSig != "" {
-		base := firstSig
+		signaturePath := firstSig
+		if !filepath.IsAbs(signaturePath) {
+			signaturePath = filepath.Join(root, signaturePath)
+		}
+		base := signaturePath
 		if len(base) > 2 && base[len(base)-2:] == ".x" {
 			base = base[:len(base)-2]
 		}
-		fmt.Printf("Verify detached signatures with e.g.:\n  fortitool pkg inspect --content %s %s\n", base, firstSig)
+		fmt.Println(pkgInspectSuggestion(runtime.GOOS, base, signaturePath))
 	}
 	return nil
 }
