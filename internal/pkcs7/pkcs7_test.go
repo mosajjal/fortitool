@@ -153,4 +153,9 @@ func TestFindPackageIDs(t *testing.T) {
 	if len(ids) != 2 {
 		t.Fatalf("got %d ids, want 2: %v", len(ids), ids)
 	}
+	for _, limit := range []int{0, -1} {
+		if ids := FindPackageIDs(payload, limit); len(ids) != 0 {
+			t.Fatalf("limit %d returned %d ids: %v", limit, len(ids), ids)
+		}
+	}
 }
