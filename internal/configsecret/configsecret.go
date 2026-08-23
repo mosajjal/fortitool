@@ -155,15 +155,15 @@ func DecryptLegacy(b64 string) (*Result, error) {
 	if hasEra74Marker(ct) {
 		return nil, ErrEra74Unidentified
 	}
-	if len(ct) == 0 || len(ct)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("ciphertext length %d not a multiple of the AES block size", len(ct))
-	}
 	return decryptWith(legacyKey, iv, ct, ErrNotLegacyFormat)
 }
 
 // decryptWith runs AES-CBC under the given key and interprets the
 // plaintext per the two known blob layouts.
 func decryptWith(key, iv, ct []byte, notPlausibleErr error) (*Result, error) {
+	if len(ct) == 0 || len(ct)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext length %d not a multiple of the AES block size", len(ct))
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err

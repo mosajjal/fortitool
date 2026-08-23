@@ -36,6 +36,9 @@ func verifySigner(si *SignerInfo, content []byte) VerifyResult {
 	if si.digestHash == 0 {
 		return VerifyResult{Signer: si, Reason: fmt.Sprintf("unsupported digest algorithm %s", si.DigestAlgorithm)}
 	}
+	if err := validateSignatureAlgorithm(si.signatureOID, si.signatureParameters, si.digestHash); err != nil {
+		return VerifyResult{Signer: si, Reason: err.Error()}
+	}
 	if si.Certificate == nil {
 		return VerifyResult{Signer: si, Reason: "no certificate for signer"}
 	}

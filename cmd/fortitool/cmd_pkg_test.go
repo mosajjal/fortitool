@@ -293,7 +293,10 @@ func buildPackageSignedData(t *testing.T, certDER []byte, privateKey *rsa.Privat
 	certificates := testDERTLV(0xa0, certDER)
 	issuerAndSerial := testDERTLV(0x30, append(cert.RawIssuer, marshalPackageASN1(t, cert.SerialNumber)...))
 	digestAlgorithm := marshalPackageASN1(t, testAlgorithmIdentifier{Algorithm: testOIDSHA256})
-	signatureAlgorithm := marshalPackageASN1(t, testAlgorithmIdentifier{Algorithm: testOIDRSAEncryption})
+	signatureAlgorithm := marshalPackageASN1(t, testAlgorithmIdentifier{
+		Algorithm:  testOIDRSAEncryption,
+		Parameters: asn1.RawValue{Tag: asn1.TagNull},
+	})
 
 	var signerInfosBody []byte
 	for _, valid := range validSigners {

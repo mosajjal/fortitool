@@ -2,6 +2,34 @@ package pkcs7
 
 import "fmt"
 
+// Detached signature wrappers are small; these ceilings leave generous
+// headroom while bounding recursive normalization and repeated copying.
+const (
+	maxBERInputSize  = 64 << 20
+	maxDEROutputSize = 64 << 20
+	maxBERDepth      = 64
+	maxBERWork       = 256 << 20
+)
+
+type berLimits struct {
+	inputSize  int
+	outputSize int
+	depth      int
+	work       int
+}
+
+var defaultBERLimits = berLimits{
+	inputSize:  maxBERInputSize,
+	outputSize: maxDEROutputSize,
+	depth:      maxBERDepth,
+	work:       maxBERWork,
+}
+
+type berDecoder struct {
+	limits berLimits
+	work   int
+}
+
 // berToDER converts one top-level BER-encoded TLV into DER, i.e. it
 // rewrites any BER indefinite-length constructed elements (identifier
 // followed by a 0x80 length octet, terminated by an EOC 0x00 0x00 marker)
@@ -16,6 +44,21 @@ import "fmt"
 // 16-byte "TNTF" footer after the ASN.1 blob) are left for the caller to
 // ignore.
 func berToDER(data []byte) ([]byte, int, error) {
+	return berToDERWithLimits(data, defaultBERLimits)
+}
+
+func berToDERWithLimits(data []byte, limits berLimits) ([]byte, int, error) {
+	if len(data) > limits.inputSize {
+		return nil, 0, fmt.Errorf("BER input length %d exceeds limit %d", len(data), limits.inputSize)
+	}
+	decoder := berDecoder{limits: limits}
+	return decoder.convert(data, 1)
+}
+
+func (d *berDecoder) convert(data []byte, depth int) ([]byte, int, error) {
+	if depth > d.limits.depth {
+		return nil, 0, fmt.Errorf("BER nesting depth exceeds limit %d", d.limits.depth)
+	}
 	if len(data) < 2 {
 		return nil, 0, fmt.Errorf("truncated BER element: need at least 2 bytes, got %d", len(data))
 	}
@@ -52,13 +95,18 @@ func berToDER(data []byte) ([]byte, int, error) {
 		length = int(lb)
 	default:
 		n := int(lb & 0x7F)
-		if n == 0 || n > 8 || off+n > len(data) {
+		if n == 0 || n > 8 || n > len(data)-off {
 			return nil, 0, fmt.Errorf("bad long-form length octet count %d", n)
 		}
+		var encodedLength uint64
 		for i := 0; i < n; i++ {
-			length = length<<8 | int(data[off])
+			encodedLength = encodedLength<<8 | uint64(data[off])
 			off++
 		}
+		if encodedLength > uint64(len(data)-off) {
+			return nil, 0, fmt.Errorf("definite length %d exceeds remaining %d bytes", encodedLength, len(data)-off)
+		}
+		length = int(encodedLength)
 	}
 
 	if indefinite {
@@ -67,50 +115,86 @@ func berToDER(data []byte) ([]byte, int, error) {
 		}
 		var content []byte
 		for {
-			if off+2 <= len(data) && data[off] == 0x00 && data[off+1] == 0x00 {
+			if len(data)-off >= 2 && data[off] == 0x00 && data[off+1] == 0x00 {
 				off += 2
 				break
 			}
 			if off >= len(data) {
 				return nil, 0, fmt.Errorf("unterminated indefinite-length element")
 			}
-			child, n, err := berToDER(data[off:])
+			child, n, err := d.convert(data[off:], depth+1)
 			if err != nil {
 				return nil, 0, fmt.Errorf("indefinite-length child at offset %d: %w", off, err)
 			}
-			content = append(content, child...)
+			content, err = d.appendContent(content, child)
+			if err != nil {
+				return nil, 0, err
+			}
 			off += n
 		}
-		out := append(append([]byte{}, identifier...), encodeDERLength(len(content))...)
-		out = append(out, content...)
-		return out, off, nil
+		out, err := d.makeTLV(identifier, content)
+		return out, off, err
 	}
 
-	if off+length > len(data) {
+	if length > len(data)-off {
 		return nil, 0, fmt.Errorf("definite length %d exceeds remaining %d bytes", length, len(data)-off)
 	}
 	raw := data[off : off+length]
 	off += length
 
 	if !constructed {
-		out := append(append([]byte{}, identifier...), encodeDERLength(length)...)
-		out = append(out, raw...)
-		return out, off, nil
+		out, err := d.makeTLV(identifier, raw)
+		return out, off, err
 	}
 
 	var content []byte
-	pos := 0
-	for pos < len(raw) {
-		child, n, err := berToDER(raw[pos:])
+	for pos := 0; pos < len(raw); {
+		child, n, err := d.convert(raw[pos:], depth+1)
 		if err != nil {
 			return nil, 0, fmt.Errorf("definite-length constructed child at offset %d: %w", pos, err)
 		}
-		content = append(content, child...)
+		content, err = d.appendContent(content, child)
+		if err != nil {
+			return nil, 0, err
+		}
 		pos += n
 	}
-	out := append(append([]byte{}, identifier...), encodeDERLength(len(content))...)
+	out, err := d.makeTLV(identifier, content)
+	return out, off, err
+}
+
+func (d *berDecoder) appendContent(dst, src []byte) ([]byte, error) {
+	if len(src) > d.limits.outputSize-len(dst) {
+		return nil, fmt.Errorf("normalized DER content exceeds output limit %d", d.limits.outputSize)
+	}
+	if err := d.consumeWork(len(src)); err != nil {
+		return nil, err
+	}
+	return append(dst, src...), nil
+}
+
+func (d *berDecoder) makeTLV(identifier, content []byte) ([]byte, error) {
+	length := encodeDERLength(len(content))
+	if len(identifier) > d.limits.outputSize-len(length) || len(content) > d.limits.outputSize-len(identifier)-len(length) {
+		return nil, fmt.Errorf("normalized DER element exceeds output limit %d", d.limits.outputSize)
+	}
+	outLen := len(identifier) + len(length) + len(content)
+	if err := d.consumeWork(outLen); err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, outLen)
+	out = append(out, identifier...)
+	out = append(out, length...)
 	out = append(out, content...)
-	return out, off, nil
+	return out, nil
+}
+
+func (d *berDecoder) consumeWork(n int) error {
+	if n > d.limits.work-d.work {
+		return fmt.Errorf("BER normalization work exceeds limit %d", d.limits.work)
+	}
+	d.work += n
+	return nil
 }
 
 func encodeDERLength(n int) []byte {
