@@ -181,6 +181,28 @@ func TestFindSeedMaterialNotFound(t *testing.T) {
 	}
 }
 
+func TestFindSeedMaterialChaChaSeedAtFinalAlignedOffset(t *testing.T) {
+	key := genTestRSAKey(t)
+	seed := make([]byte, seedLen)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	split := chachaSplits[0]
+	encBlob := chacha20Decrypt(seed, split[0], split[1], key.der)
+
+	kernelPayload := make([]byte, 304)
+	copy(kernelPayload, encBlob)
+	copy(kernelPayload[len(kernelPayload)-seedLen:], seed)
+
+	sm := scanChaChaFamily(context.Background(), kernelPayload)
+	if sm == nil {
+		t.Fatal("seed material not found")
+	}
+	if sm.SeedOffset != len(kernelPayload)-seedLen {
+		t.Fatalf("seed offset = %d, want %d", sm.SeedOffset, len(kernelPayload)-seedLen)
+	}
+}
+
 // TestDecryptRootfs_ChaCha20Body covers the 7.4.1-7.4.3 era: the body is
 // ChaCha20-encrypted with key/IV derived by rotated-SHA256 of the seed
 // (Optistream fortigate-crypto scheme: key = SHA256(seed[4:]+seed[:4]),
