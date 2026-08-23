@@ -83,6 +83,16 @@ func cmdPkgInspect(args []string) error {
 		fs.Usage()
 		return fmt.Errorf("usage: fortitool pkg inspect [--content <payload>] <sig.x>")
 	}
+	contentSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "content" {
+			contentSet = true
+		}
+	})
+	if contentSet && *content == "" {
+		fs.Usage()
+		return usagef("--content requires a non-empty path")
+	}
 	sigPath := fs.Arg(0)
 
 	der, err := os.ReadFile(sigPath)
@@ -100,7 +110,7 @@ func cmdPkgInspect(args []string) error {
 		fmt.Printf("          <- %s\n", cert.Issuer)
 	}
 
-	if *content == "" {
+	if !contentSet {
 		fmt.Println("[i] pass --content <payload> to verify the signature and read package ids")
 		return nil
 	}

@@ -53,6 +53,50 @@ func TestCmdPkgInspectArgumentOrderAndArity(t *testing.T) {
 	}
 }
 
+func TestCmdPkgInspectRejectsExplicitEmptyContent(t *testing.T) {
+	_, signaturePath := writePackageFixture(t, []bool{true})
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "equals form", args: []string{"--content=", signaturePath}},
+		{name: "separate argument", args: []string{"--content", "", signaturePath}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, stderr, err := captureCommandOutput(t, func() error {
+				return cmdPkgInspect(test.args)
+			})
+			if err == nil || !strings.Contains(err.Error(), "--content requires a non-empty path") {
+				t.Fatalf("cmdPkgInspect error = %v, want explicit empty content error", err)
+			}
+			if got := commandExitCode(err); got != 2 {
+				t.Fatalf("commandExitCode(error) = %d, want 2", got)
+			}
+			if !strings.Contains(stderr, "fortitool pkg inspect [--content <payload>] <sig.x>") {
+				t.Fatalf("stderr does not contain inspect usage:\n%s", stderr)
+			}
+		})
+	}
+}
+
+func TestCmdPkgInspectWithoutContentRemainsInspectionOnly(t *testing.T) {
+	_, signaturePath := writePackageFixture(t, []bool{true})
+	stdout, _, err := captureCommandOutput(t, func() error {
+		return cmdPkgInspect([]string{signaturePath})
+	})
+	if err != nil {
+		t.Fatalf("cmdPkgInspect: %v", err)
+	}
+	if !strings.Contains(stdout, "pass --content <payload> to verify") {
+		t.Fatalf("stdout does not describe optional verification:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "cryptographic integrity:") {
+		t.Fatalf("inspection-only output unexpectedly contains a verification result:\n%s", stdout)
+	}
+}
+
 func TestCmdPkgInspectVerificationPolicy(t *testing.T) {
 	tests := []struct {
 		name       string
