@@ -20,7 +20,7 @@ import (
 var nestedTarXZMembers = []string{"bin.tar.xz", "usr.tar.xz", "migadmin.tar.xz", "node-scripts.tar.xz"}
 
 func cmdDecrypt(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("decrypt", flag.ContinueOnError)
+	fs := newCommandFlagSet("decrypt", nil)
 	outDir := fs.String("o", "", "output directory (required)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool decrypt -- full pipeline: raw .out -> unpacked rootfs, one command
@@ -80,7 +80,7 @@ EXIT CODES
 		return err
 	}
 
-	fmt.Printf("[1/6] loading %s\n", inPath)
+	fmt.Printf("[1/6] loading %s\n", terminalText(inPath))
 	raw, err := os.ReadFile(inPath)
 	if err != nil {
 		return err
@@ -97,7 +97,7 @@ EXIT CODES
 		return fmt.Errorf("no valid L1 key found")
 	}
 	if wasEncrypted {
-		fmt.Printf("      key: %s\n", key)
+		fmt.Printf("      key: %s\n", terminalText(string(key)))
 	} else {
 		fmt.Println("      already cleartext")
 	}
@@ -107,7 +107,7 @@ EXIT CODES
 	if err != nil {
 		return fmt.Errorf("volume discovery: %w", err)
 	}
-	fmt.Printf("      layout: %s\n", layout)
+	fmt.Printf("      layout: %s\n", terminalText(layout))
 
 	extract := func(name string) ([]byte, error) {
 		data, err := volume.ReadFile(name)
@@ -168,7 +168,7 @@ EXIT CODES
 		// e.g. bin.tar.xz contains "./bin/acd" -- extract into rootfsDir
 		// itself so it merges in place instead of double-nesting.
 		if err := archive.ExtractXZTar(data, rootfsDir); err != nil {
-			fmt.Printf("      [-] %s: %v\n", member, err)
+			fmt.Printf("      [-] %s: %s\n", member, terminalText(err.Error()))
 			continue
 		}
 		fmt.Printf("      %s merged into rootfs/\n", member)
@@ -176,7 +176,7 @@ EXIT CODES
 
 	if datafsGz, err := os.ReadFile(filepath.Join(*outDir, "datafs.tar.gz")); err == nil {
 		if err := archive.ExtractGzipTar(datafsGz, filepath.Join(*outDir, "datafs")); err != nil {
-			fmt.Printf("      [-] datafs.tar.gz: %v\n", err)
+			fmt.Printf("      [-] datafs.tar.gz: %s\n", terminalText(err.Error()))
 		} else {
 			fmt.Println("      datafs.tar.gz -> datafs/")
 		}
@@ -184,9 +184,9 @@ EXIT CODES
 
 	initPath := filepath.Join(rootfsDir, "bin", "init")
 	if st, err := os.Stat(initPath); err == nil {
-		fmt.Printf("\n[+] DONE: %s (%d bytes)\n", initPath, st.Size())
+		fmt.Printf("\n[+] DONE: %s (%d bytes)\n", terminalText(initPath), st.Size())
 	} else {
-		fmt.Printf("\n[+] DONE: unpacked under %s\n", *outDir)
+		fmt.Printf("\n[+] DONE: unpacked under %s\n", terminalText(*outDir))
 	}
 	return nil
 }

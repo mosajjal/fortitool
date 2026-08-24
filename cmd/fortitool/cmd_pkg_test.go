@@ -149,11 +149,76 @@ func TestCmdPkgScanRegularFilesAndSuggestion(t *testing.T) {
 		"Scanned 3 regular files",
 		"== ELF (1) ==",
 		"== PKCS#7 SignedData (1) ==",
-		"fortitool pkg inspect --content component component.x",
+		"fortitool pkg inspect --content " + quoteCommandArgument(filepath.Join(root, "component")) + " " + quoteCommandArgument(filepath.Join(root, "component.x")),
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout does not contain %q:\n%s", want, stdout)
 		}
+	}
+}
+
+func TestCmdPkgScanOmitsSuggestionForControlPaths(t *testing.T) {
+	root := t.TempDir()
+	payloadName := "component $(echo unsafe) \x1b\u202e'payload"
+	signatureName := payloadName + ".x"
+	payload := []byte("synthetic package payload")
+	certDER, privateKey := buildPackageTestCertificate(t)
+	signature := buildPackageSignedData(t, certDER, privateKey, payload, []bool{true})
+	writeTestFile(t, filepath.Join(root, payloadName), payload)
+	writeTestFile(t, filepath.Join(root, signatureName), signature)
+
+	stdout, _, err := captureCommandOutput(t, func() error { return cmdPkgScan([]string{root}) })
+	if err != nil {
+		t.Fatalf("cmdPkgScan: %v", err)
+	}
+	if strings.Contains(stdout, "\x1b") {
+		t.Fatalf("stdout contains a literal escape byte:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "\u202e") {
+		t.Fatalf("stdout contains a literal bidi override:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "--content") {
+		t.Fatalf("stdout contains a copyable command for a control-bearing path:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "no copyable command") {
+		t.Fatalf("stdout does not explain why the command was omitted:\n%s", stdout)
+	}
+}
+
+func TestCmdPkgScanQuotesPrintableShellMetacharacters(t *testing.T) {
+	root := t.TempDir()
+	payloadName := "component $(echo unsafe) 'payload"
+	signatureName := payloadName + ".x"
+	payload := []byte("synthetic package payload")
+	certDER, privateKey := buildPackageTestCertificate(t)
+	signature := buildPackageSignedData(t, certDER, privateKey, payload, []bool{true})
+	writeTestFile(t, filepath.Join(root, payloadName), payload)
+	writeTestFile(t, filepath.Join(root, signatureName), signature)
+
+	stdout, _, err := captureCommandOutput(t, func() error { return cmdPkgScan([]string{root}) })
+	if err != nil {
+		t.Fatalf("cmdPkgScan: %v", err)
+	}
+	contentPath := filepath.Join(root, payloadName)
+	signaturePath := filepath.Join(root, signatureName)
+	want := "fortitool pkg inspect --content " + quoteCommandArgument(contentPath) + " " + quoteCommandArgument(signaturePath)
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("stdout does not contain safely quoted rooted suggestion %q:\n%s", want, stdout)
+	}
+}
+
+func TestPkgInspectSuggestionOmitsShellSyntaxOnWindows(t *testing.T) {
+	content := `component & whoami | echo %PATH% ^ !`
+	signature := content + `.x`
+	suggestion := pkgInspectSuggestion("windows", content, signature)
+	if strings.Contains(suggestion, content) || strings.Contains(suggestion, signature) {
+		t.Fatalf("Windows suggestion contains attacker-controlled shell text: %s", suggestion)
+	}
+	if strings.Contains(suggestion, "--content") {
+		t.Fatalf("Windows suggestion is unexpectedly copyable shell syntax: %s", suggestion)
+	}
+	if !strings.Contains(suggestion, "no copyable command") {
+		t.Fatalf("Windows suggestion does not explain the safety boundary: %s", suggestion)
 	}
 }
 

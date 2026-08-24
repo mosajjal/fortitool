@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"errors"
 	"os"
 	"os/exec"
@@ -43,7 +46,9 @@ func TestCLIExitCodeContract(t *testing.T) {
 	}{
 		{name: "top-level help", args: []string{"-h"}, wantCode: 0, wantText: "USAGE"},
 		{name: "top-level help alias", args: []string{"help"}, wantCode: 0, wantText: "COMMANDS"},
+		{name: "top-level help alias extra argument", args: []string{"help", "extra"}, wantCode: 2, wantText: "usage: fortitool help"},
 		{name: "version", args: []string{"--version"}, wantCode: 0, wantText: "fortitool " + version},
+		{name: "version extra argument", args: []string{"version", "extra"}, wantCode: 2, wantText: "usage: fortitool version"},
 		{name: "missing command", wantCode: 2, wantText: "USAGE"},
 		{name: "unknown command", args: []string{"unknown"}, wantCode: 2, wantText: "unknown command"},
 
@@ -102,6 +107,93 @@ func TestCLIExitCodeContract(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigCiphertextSources(t *testing.T) {
+	secret := "line one\nline two"
+	ciphertext := encryptConfigSecretForCLI(t, secret)
+	inputFile := filepath.Join(t.TempDir(), "ciphertext.txt")
+	if err := os.WriteFile(inputFile, []byte(ciphertext+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		args     []string
+		stdin    string
+		wantCode int
+		wantText string
+	}{
+		{name: "stdin", args: []string{"config", "decrypt", "--stdin"}, stdin: ciphertext + "\n", wantCode: 0, wantText: "line one\\x0aline two"},
+		{name: "file", args: []string{"config", "decrypt", "--file", inputFile}, wantCode: 0, wantText: "line one\\x0aline two"},
+		{name: "argv compatibility", args: []string{"config", "decrypt", ciphertext}, wantCode: 0, wantText: "line one\\x0aline two"},
+		{name: "stdin and argv", args: []string{"config", "decrypt", "--stdin", ciphertext}, stdin: ciphertext, wantCode: 2, wantText: "select exactly one ciphertext source"},
+		{name: "file and argv", args: []string{"config", "decrypt", "--file", inputFile, ciphertext}, wantCode: 2, wantText: "select exactly one ciphertext source"},
+		{name: "stdin and file", args: []string{"config", "decrypt", "--stdin", "--file", inputFile}, stdin: ciphertext, wantCode: 2, wantText: "select exactly one ciphertext source"},
+		{name: "empty file path", args: []string{"config", "decrypt", "--file="}, wantCode: 2, wantText: "FILE must not be empty"},
+		{name: "empty file path and argv", args: []string{"config", "decrypt", "--file=", ciphertext}, wantCode: 2, wantText: "select exactly one ciphertext source"},
+		{name: "empty stdin", args: []string{"config", "decrypt", "--stdin"}, wantCode: 1, wantText: "ciphertext input is empty"},
+		{name: "internal whitespace", args: []string{"config", "decrypt", "--stdin"}, stdin: "AAAA BBBB\n", wantCode: 1, wantText: "internal whitespace"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := runCLISubprocess(t, test.args, test.stdin)
+			if result.code != test.wantCode {
+				t.Fatalf("exit code = %d, want %d\nstdout:\n%s\nstderr:\n%s", result.code, test.wantCode, result.stdout, result.stderr)
+			}
+			if combined := result.stdout + result.stderr; !strings.Contains(combined, test.wantText) {
+				t.Fatalf("output does not contain %q\nstdout:\n%s\nstderr:\n%s", test.wantText, result.stdout, result.stderr)
+			}
+			if strings.Contains(result.stdout, "\nline two") {
+				t.Fatalf("decrypted control byte was written literally:\n%s", result.stdout)
+			}
+		})
+	}
+}
+
+func TestReadConfigCiphertextLimit(t *testing.T) {
+	input := strings.Repeat("A", maxConfigCiphertextBytes+1)
+	if _, err := readConfigCiphertext(strings.NewReader(input)); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized input error = %v", err)
+	}
+}
+
+func TestTerminalText(t *testing.T) {
+	input := "plain\tline\n\x1b\x7f\u0085\u202e\u2066" + string([]byte{0xff})
+	want := `plain\x09line\x0a\x1b\x7f\x85\u202e\u2066\xff`
+	if got := terminalText(input); got != want {
+		t.Fatalf("terminalText() = %q, want %q", got, want)
+	}
+}
+
+func TestCLIErrorEscapesTerminalControls(t *testing.T) {
+	result := runCLISubprocess(t, []string{"l1", "--invalid\x1bflag"}, "")
+	if result.code != 2 {
+		t.Fatalf("exit code = %d, want 2\nstdout:\n%s\nstderr:\n%s", result.code, result.stdout, result.stderr)
+	}
+	if strings.Contains(result.stderr, "\x1b") {
+		t.Fatalf("stderr contains a literal escape byte:\n%s", result.stderr)
+	}
+	if !strings.Contains(result.stderr, `\x1b`) {
+		t.Fatalf("stderr does not contain an escaped control byte:\n%s", result.stderr)
+	}
+}
+
+func encryptConfigSecretForCLI(t *testing.T, secret string) string {
+	t.Helper()
+	padding := aes.BlockSize - len(secret)%aes.BlockSize
+	plaintext := append([]byte(secret), bytes.Repeat([]byte{byte(padding)}, padding)...)
+	ivPrefix := []byte{1, 2, 3, 4}
+	iv := make([]byte, aes.BlockSize)
+	copy(iv, ivPrefix)
+	block, err := aes.NewCipher([]byte("Mary had a littl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := make([]byte, len(plaintext))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, plaintext)
+	return base64.StdEncoding.EncodeToString(append(ivPrefix, ciphertext...))
 }
 
 type cliResult struct {

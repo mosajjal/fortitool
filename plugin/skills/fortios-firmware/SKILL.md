@@ -27,7 +27,8 @@ or build from source (`git clone https://github.com/mosajjal/fortitool && cd for
 | `fortitool unpack -o outdir archive` | Generic gzip+tar / xz+tar extraction |
 | `fortitool pkg scan datafs/` | Classify files in a directory, find PKCS#7 signatures |
 | `fortitool pkg inspect --content payload sig.x` | Verify every signer in a detached PKCS#7 signature (integrity only; no trust-chain validation) |
-| `fortitool config decrypt <base64-blob>` | Decrypt a config-backup `ENC` secret |
+| `fortitool config decrypt --stdin` | Decrypt a config-backup `ENC` secret without exposing it in argv |
+| `fortitool config decrypt --file ciphertext.txt` | Decrypt a config-backup `ENC` secret from a file |
 
 Every crypto layer auto-detects its era/scheme (no version or CPU
 architecture flag). Run `fortitool <command> -h` for that command's full
@@ -47,5 +48,8 @@ parser doesn't permute argv).
   through FortiOS 7.2.3, and >=7.4/build 2731) -- no flags needed. If it
   still reports an unrecognized format, the field's blob layout isn't one
   of the two known ones yet, not a version issue.
+- Prefer `config decrypt --stdin` or `--file` so ciphertext does not appear
+  in process listings or shell history. Direct argv input is retained only
+  for compatibility; do not combine input sources.
 - Exit code 0 = succeeded (including "already cleartext" / recognized
   unsupported cases where relevant); 1 = failed; 2 = usage error.

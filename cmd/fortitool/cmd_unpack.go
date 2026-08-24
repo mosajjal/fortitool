@@ -13,7 +13,7 @@ import (
 )
 
 func cmdUnpack(_ context.Context, args []string) error {
-	fs := flag.NewFlagSet("unpack", flag.ContinueOnError)
+	fs := newCommandFlagSet("unpack", nil)
 	out := fs.String("o", "", "output directory (required)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool unpack -- extract a gzip+tar or xz+tar archive
@@ -71,6 +71,6 @@ EXIT CODES
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[+] unpacked to %s\n", *out)
+	fmt.Printf("[+] unpacked to %s\n", terminalText(*out))
 	return nil
 }

@@ -41,13 +41,19 @@ fortitool rootfs -o out.gz flatkc rootfs.gz    # rootfs crypto layer only
 fortitool unpack -o outdir archive.tar.xz      # generic gzip+tar / xz+tar
 fortitool pkg inspect --content payload sig.x  # verify a PKCS#7 signature
 fortitool pkg scan datafs/                     # classify files, find sigs
-fortitool config decrypt <base64-blob>         # config-backup ENC secret
+fortitool config decrypt --stdin < secret.txt  # config-backup ENC secret
+fortitool config decrypt --file secret.txt     # file input without argv exposure
 ```
 
 Every command has a full description, flags, and examples via
 `fortitool <command> -h` (or run `fortitool -h` for the command list).
 Flags must precede positional arguments — Go's `flag` package doesn't
 permute argv the way getopt does.
+
+For config secrets, prefer `--stdin` or `--file` so the ciphertext does
+not appear in process listings or shell history. The direct
+`fortitool config decrypt <base64-blob>` form remains available only for
+compatibility, and exactly one of the three input sources is accepted.
 
 With `pkg inspect --content`, verification succeeds only when the wrapper
 contains at least one signer and every `SignerInfo` validates against the

@@ -29,7 +29,7 @@ func gunzipOuter(data []byte) ([]byte, error) {
 }
 
 func cmdL1(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("l1", flag.ContinueOnError)
+	fs := newCommandFlagSet("l1", nil)
 	out := fs.String("o", "", "output file (default: <input>.decrypted)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool l1 -- decrypt the outer FortiOS ".out" firmware container
@@ -102,11 +102,11 @@ EXIT CODES
 	if !wasEncrypted {
 		fmt.Println("[+] image is already cleartext at L1")
 	} else {
-		fmt.Printf("[+] key: %s\n", key)
+		fmt.Printf("[+] key: %s\n", terminalText(string(key)))
 	}
 	if err := os.WriteFile(*out, plain, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("[+] wrote %s (%d bytes)\n", *out, len(plain))
+	fmt.Printf("[+] wrote %s (%d bytes)\n", terminalText(*out), len(plain))
 	return nil
 }
