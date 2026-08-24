@@ -67,17 +67,18 @@ EXIT CODES
   0  decrypted successfully (or was already cleartext)
   1  no valid key found -- this usually means the input isn't a FortiOS
      .out image, or uses a crypto scheme this tool doesn't know yet
+  2  invalid flags or wrong number of positional arguments
 `)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		return err
+		return usage(err)
 	}
-	if fs.NArg() < 1 {
+	if fs.NArg() != 1 {
 		fs.Usage()
-		return fmt.Errorf("missing required argument: <image.out>")
+		return usagef("usage: fortitool l1 [-o FILE] <image.out>")
 	}
 	inPath := fs.Arg(0)
 	if *out == "" {

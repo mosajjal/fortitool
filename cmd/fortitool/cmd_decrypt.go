@@ -62,17 +62,18 @@ EXIT CODES
   0  full pipeline succeeded
   1  failed at some stage -- stdout shows which step ([1/6]..[6/6]) and
      the error indicates why (wrong file, unsupported crypto era, etc.)
+  2  invalid flags, missing -o, or wrong number of positional arguments
 `)
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
-		return err
+		return usage(err)
 	}
-	if fs.NArg() < 1 || *outDir == "" {
+	if fs.NArg() != 1 || *outDir == "" {
 		fs.Usage()
-		return fmt.Errorf("missing required argument or -o flag")
+		return usagef("usage: fortitool decrypt -o OUTDIR <image.out>")
 	}
 	inPath := fs.Arg(0)
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
