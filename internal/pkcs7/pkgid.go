@@ -13,6 +13,9 @@ var pkgIDPattern = regexp.MustCompile(
 // e.g. "06004000NIDS00105-000070059-2601051815", returning up to limit
 // unique matches in order of first appearance.
 func FindPackageIDs(payload []byte, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
 	var out []string
 	seen := make(map[string]bool)
 	for _, m := range pkgIDPattern.FindAll(payload, -1) {
