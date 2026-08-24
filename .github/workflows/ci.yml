@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  go:
+    name: Go 1.26.6
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go 1.26.6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.6'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Check toolchain
+        run: |
+          go version
+          test "$(go env GOVERSION)" = go1.26.6
+      - name: Check module files
+        run: |
+          go mod tidy -diff
+          go mod verify
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'gofmt required:\n%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet -mod=readonly ./...
+      - name: Test
+        run: go test -mod=readonly -count=1 ./...
+      - name: Test with race detector
+        env:
+          CGO_ENABLED: '1'
+        run: go test -mod=readonly -race -count=1 ./...
+      - name: Build static binary
+        env:
+          CGO_ENABLED: '0'
+        run: go build -mod=readonly -trimpath -o "$RUNNER_TEMP/fortitool" ./cmd/fortitool
+      - name: Check static binary
+        run: |
+          binary="$RUNNER_TEMP/fortitool"
+          file "$binary"
+          test "$(go version -m "$binary" | sed -n '1s/.*: //p')" = go1.26.6
+          if readelf -lW "$binary" | grep -Eq '^[[:space:]]*INTERP[[:space:]]'; then
+            echo 'static binary contains an ELF interpreter'
+            exit 1
+          fi
+          if readelf -dW "$binary" 2>&1 | grep -Fq '(NEEDED)'; then
+            echo 'static binary contains a dynamic dependency'
+            exit 1
+          fi
+      - name: Check clean tree
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  linux-386:
+    name: Linux/386 build and runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: '0'
+      GOOS: linux
+      GOARCH: '386'
+      GO386: sse2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go 1.26.6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.6'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Check toolchain
+        run: test "$(go env GOVERSION)" = go1.26.6
+      - name: Test on Linux/386
+        run: go test -mod=readonly -count=1 ./...
+      - name: Build and run Linux/386 binary
+        run: |
+          binary="$RUNNER_TEMP/fortitool-linux-386"
+          go build -mod=readonly -trimpath -o "$binary" ./cmd/fortitool
+          file "$binary" | grep -F 'ELF 32-bit'
+          if readelf -lW "$binary" | grep -Eq '^[[:space:]]*INTERP[[:space:]]'; then
+            echo 'Linux/386 binary contains an ELF interpreter'
+            exit 1
+          fi
+          "$binary" version
+
+  cross-build:
+    name: Compile only (${{ matrix.label }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux/armv7
+            goos: linux
+            goarch: arm
+            goarm: '7'
+          - label: linux/arm64
+            goos: linux
+            goarch: arm64
+          - label: linux/ppc64le
+            goos: linux
+            goarch: ppc64le
+          - label: freebsd/amd64
+            goos: freebsd
+            goarch: amd64
+          - label: darwin/arm64
+            goos: darwin
+            goarch: arm64
+          - label: windows/amd64
+            goos: windows
+            goarch: amd64
+    env:
+      CGO_ENABLED: '0'
+      TARGET_GOOS: ${{ matrix.goos }}
+      TARGET_GOARCH: ${{ matrix.goarch }}
+      TARGET_GOARM: ${{ matrix.goarm }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go 1.26.6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.6'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Check toolchain
+        run: test "$(go env GOVERSION)" = go1.26.6
+      - name: Cross-build command
+        run: |
+          if [ -n "${TARGET_GOARM:-}" ]; then
+            export GOARM="$TARGET_GOARM"
+          fi
+          suffix=""
+          if [ "$TARGET_GOOS" = windows ]; then
+            suffix=".exe"
+          fi
+          GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH" \
+            go build -mod=readonly -trimpath \
+            -o "$RUNNER_TEMP/fortitool-${TARGET_GOOS}-${TARGET_GOARCH}${suffix}" \
+            ./cmd/fortitool
+
+  plugin:
+    name: Plugin manifests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          check-latest: false
+          package-manager-cache: false
+      - name: Install manifest validator
+        run: npm install --global @anthropic-ai/claude-code@2.1.231
+      - name: Check validator version
+        run: test "$(claude --version)" = '2.1.231 (Claude Code)'
+      - name: Validate manifests
+        run: |
+          jq -e . .claude-plugin/marketplace.json >/dev/null
+          jq -e . plugin/.claude-plugin/plugin.json >/dev/null
+          claude plugin validate .claude-plugin/marketplace.json --strict
+          claude plugin validate plugin/.claude-plugin/plugin.json --strict
