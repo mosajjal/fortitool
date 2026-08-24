@@ -1,11 +1,14 @@
 package configsecret
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -200,6 +203,53 @@ func TestDecryptEra74RejectsNonMarker(t *testing.T) {
 	if _, err := DecryptEra74(b64); err == nil {
 		t.Fatal("expected error for a blob without the era marker")
 	}
+}
+
+func TestDecryptEra74RejectsMalformedCiphertextWithoutPanic(t *testing.T) {
+	entrypoints := map[string]func(string) (*Result, error){
+		"auto":     Decrypt,
+		"explicit": DecryptEra74,
+	}
+	for _, ciphertextLen := range []int{0, 1, 15, 17, 31} {
+		ciphertextLen := ciphertextLen
+		blob := append(make([]byte, 4), bytes.Repeat([]byte{0xA5}, ciphertextLen)...)
+		blob = append(blob, era74Marker...)
+		b64 := base64.StdEncoding.EncodeToString(blob)
+
+		for name, decrypt := range entrypoints {
+			t.Run(fmt.Sprintf("%s/length-%d", name, ciphertextLen), func(t *testing.T) {
+				_, err := decryptNoPanic(t, decrypt, b64)
+				if err == nil || !strings.Contains(err.Error(), "ciphertext length") {
+					t.Fatalf("err = %v, want ciphertext-length error", err)
+				}
+			})
+		}
+	}
+}
+
+func decryptNoPanic(t *testing.T, decrypt func(string) (*Result, error), b64 string) (res *Result, err error) {
+	t.Helper()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("decrypt panicked: %v", recovered)
+		}
+	}()
+	return decrypt(b64)
+}
+
+func FuzzDecryptNoPanic(f *testing.F) {
+	for _, ciphertextLen := range []int{0, 1, 15, 16, 17, 31, 32} {
+		blob := append(make([]byte, 4), bytes.Repeat([]byte{0xA5}, ciphertextLen)...)
+		f.Add(base64.StdEncoding.EncodeToString(append(blob, era74Marker...)))
+	}
+	f.Add("")
+	f.Add("not-valid-base64!!!")
+
+	f.Fuzz(func(t *testing.T, b64 string) {
+		_, _ = Decrypt(b64)
+		_, _ = DecryptEra74(b64)
+		_, _ = DecryptLegacy(b64)
+	})
 }
 
 // TestEra74KeyShape pins the recovered key's length -- a silent truncation

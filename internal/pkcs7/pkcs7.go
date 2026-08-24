@@ -45,11 +45,13 @@ type SignerInfo struct {
 	SerialNumber       string
 	Certificate        *x509.Certificate
 
-	digestHash         crypto.Hash
-	rawIssuer          []byte
-	serial             *big.Int
-	authenticatedAttrs []byte // raw [0] IMPLICIT SET bytes, nil if absent
-	encryptedDigest    []byte
+	digestHash          crypto.Hash
+	signatureOID        asn1.ObjectIdentifier
+	signatureParameters asn1.RawValue
+	rawIssuer           []byte
+	serial              *big.Int
+	authenticatedAttrs  []byte // raw [0] IMPLICIT SET bytes, nil if absent
+	encryptedDigest     []byte
 }
 
 type algorithmIdentifier struct {
@@ -229,15 +231,17 @@ func parseSignerInfo(body []byte, certificates []*x509.Certificate) (SignerInfo,
 	}
 
 	si := SignerInfo{
-		DigestAlgorithm:    hashOIDName(digAlg.Algorithm),
-		SignatureAlgorithm: sigOIDName(sigAlg.Algorithm),
-		IssuerDN:           name.String(),
-		SerialNumber:       fmt.Sprintf("%X", serial),
-		digestHash:         hashOIDToHash(digAlg.Algorithm),
-		rawIssuer:          issuerNameRV.FullBytes,
-		serial:             serial,
-		authenticatedAttrs: authAttrs,
-		encryptedDigest:    encryptedDigest,
+		DigestAlgorithm:     hashOIDName(digAlg.Algorithm),
+		SignatureAlgorithm:  sigOIDName(sigAlg.Algorithm),
+		IssuerDN:            name.String(),
+		SerialNumber:        fmt.Sprintf("%X", serial),
+		digestHash:          hashOIDToHash(digAlg.Algorithm),
+		signatureOID:        sigAlg.Algorithm,
+		signatureParameters: sigAlg.Parameters,
+		rawIssuer:           issuerNameRV.FullBytes,
+		serial:              serial,
+		authenticatedAttrs:  authAttrs,
+		encryptedDigest:     encryptedDigest,
 	}
 
 	// SignerInfo identifies its certificate by issuerAndSerialNumber, not

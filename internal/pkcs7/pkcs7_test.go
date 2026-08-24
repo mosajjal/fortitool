@@ -4,7 +4,6 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -66,31 +65,48 @@ func buildTestCert(t *testing.T) (der []byte, priv *rsa.PrivateKey) {
 	return der, priv
 }
 
+type signedDataOptions struct {
+	digestOID           asn1.ObjectIdentifier
+	signatureOID        asn1.ObjectIdentifier
+	signatureParameters asn1.RawValue
+	digestHash          crypto.Hash
+}
+
 // buildSignedData assembles a ContentInfo/SignedData DER blob signing
 // `content` directly (no authenticatedAttributes) with the given cert/key.
 func buildSignedData(t *testing.T, certDER []byte, priv *rsa.PrivateKey, content []byte) []byte {
+	t.Helper()
+	return buildSignedDataWithOptions(t, certDER, priv, content, signedDataOptions{
+		digestOID:           oidSHA256,
+		signatureOID:        oidRSAEncryption,
+		signatureParameters: asn1.RawValue{Tag: asn1.TagNull},
+		digestHash:          crypto.SHA256,
+	})
+}
+
+func buildSignedDataWithOptions(t *testing.T, certDER []byte, priv *rsa.PrivateKey, content []byte, options signedDataOptions) []byte {
 	t.Helper()
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	digest := sha256.Sum256(content)
-	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, digest[:])
+	digest := hashSum(options.digestHash, content)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, options.digestHash, digest)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	digestAlgorithms := derTLV(0x31, marshal(t, algIdASN1{Algorithm: oidSHA256})) // SET OF
+	digestAlgorithms := derTLV(0x31, marshal(t, algIdASN1{Algorithm: options.digestOID})) // SET OF
 	innerContentInfo := marshal(t, struct{ ContentType asn1.ObjectIdentifier }{
 		asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}, // id-data
 	})
 	certificates := derTLV(0xA0, certDER) // [0] IMPLICIT SET OF Certificate
 
-	issuerAndSerial := append(cert.RawIssuer, marshal(t, cert.SerialNumber)...)
+	issuerAndSerial := append(append([]byte{}, cert.RawIssuer...), marshal(t, cert.SerialNumber)...)
 	issuerAndSerialSeq := derTLV(0x30, issuerAndSerial)
-	digAlg := marshal(t, algIdASN1{Algorithm: oidSHA256})
-	sigAlg := marshal(t, algIdASN1{Algorithm: oidRSAEncryption})
+	digAlg := marshal(t, algIdASN1{Algorithm: options.digestOID})
+	sigAlg := marshal(t, algIdASN1{Algorithm: options.signatureOID, Parameters: options.signatureParameters})
 	encDigest := marshal(t, sig)
 
 	signerInfoBody := append([]byte{}, marshal(t, 1)...) // version
