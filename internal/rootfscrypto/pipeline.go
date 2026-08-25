@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math/big"
 )
 
 var (
@@ -36,44 +37,75 @@ type Result struct {
 }
 
 // DecryptRootfs is the full auto-detecting rootfs.gz decryption pipeline:
-// locate seed+RSA key in the kernel payload (any known family/split), RSA-
-// unwrap the trailing signature, then try every known body-cipher layout
-// until one produces a valid gzip stream.
+// locate seed+RSA candidates in the kernel payload, select a candidate through
+// signature-envelope and body validation, then decrypt with the matching body
+// cipher.
 func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result, error) {
-	sm := FindSeedMaterial(ctx, kernelPayload)
-	if sm == nil {
+	candidates := FindSeedMaterials(ctx, kernelPayload)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no seed/RSA-key material found in kernel payload (%d bytes)", len(kernelPayload))
 	}
 
+	var matches []*Result
+	validEnvelopes := 0
+	for _, sm := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, envelopeOK := decryptRootfsCandidate(sm, rootfsGz)
+		if envelopeOK {
+			validEnvelopes++
+		}
+		if result != nil {
+			matches = append(matches, result)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return nil, fmt.Errorf("%d seed/RSA-key candidates found; %d valid signature envelopes, but no candidate passed supported body validation", len(candidates), validEnvelopes)
+	default:
+		return nil, fmt.Errorf("ambiguous rootfs crypto material: %d of %d candidates passed signature and body validation", len(matches), len(candidates))
+	}
+}
+
+func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 	modLen := (sm.Key.N.BitLen() + 7) / 8
 	if len(rootfsGz) <= modLen {
-		return nil, fmt.Errorf("rootfs.gz too small (%d bytes) for a %d-byte signature", len(rootfsGz), modLen)
+		return nil, false
 	}
 	body := rootfsGz[:len(rootfsGz)-modLen]
 	sig := rootfsGz[len(rootfsGz)-modLen:]
+	if new(big.Int).SetBytes(sig).Cmp(sm.Key.N) >= 0 {
+		return nil, false
+	}
 
 	m := rawRSAPublicOp(sig, sm.Key)
 	payload, err := pkcs1Unwrap(m)
 	if err != nil {
-		return nil, fmt.Errorf("RSA signature unwrap failed: %w", err)
+		return nil, false
 	}
 
 	bodyHash := sha256.Sum256(body)
 
 	if r := tryAESCTR(payload, body, bodyHash[:]); r != nil {
 		r.Seed = sm
-		return r, nil
+		return r, true
 	}
 	if r := tryChaCha20Body(sm, body, bodyHash[:]); r != nil {
 		r.Seed = sm
-		return r, nil
+		return r, true
 	}
 	if r := tryStreamCiphers(payload, body, bodyHash[:]); r != nil {
 		r.Seed = sm
-		return r, nil
+		return r, true
 	}
 
-	return nil, fmt.Errorf("recovered RSA key (family=%s) but no known body cipher (AES-CTR / ChaCha20 / FORT-RC4 / modified-RC4) produced a valid gzip stream", sm.Family)
+	return nil, true
 }
 
 // tryChaCha20Body handles the 7.4.1-7.4.3 era (Bishop Fox "Further
