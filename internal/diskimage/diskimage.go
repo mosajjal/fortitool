@@ -739,13 +739,13 @@ func (f *FS) extractDir(relPath, destPath string, root *os.Root, visited map[uin
 		}
 		in, err := f.readInode(e.Inode)
 		if err != nil {
-			return fmt.Errorf("diskimage: reading inode for %q: %w", childRel, err)
+			continue
 		}
 		switch in.mode & s_IFMT {
 		case s_IFREG:
-			data, err := f.ReadFile(childRel)
+			data, err := f.readInodeData(e.Inode, in)
 			if err != nil {
-				return err
+				continue
 			}
 			out, err := root.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 			if err != nil {
@@ -763,7 +763,7 @@ func (f *FS) extractDir(relPath, destPath string, root *os.Root, visited map[uin
 		case s_IFLNK:
 			targetBytes, err := f.readInodeFast(e.Inode)
 			if err != nil {
-				return fmt.Errorf("diskimage: reading symlink %q: %w", childRel, err)
+				continue
 			}
 			linkTarget, err := safeExtractSymlinkTarget(target, string(targetBytes))
 			if err != nil {

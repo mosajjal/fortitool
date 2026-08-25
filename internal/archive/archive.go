@@ -9,6 +9,7 @@ package archive
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -24,7 +25,8 @@ import (
 // destDir. This is what a decrypted rootfs.gz becomes after AES-CTR/RC4
 // decryption.
 func ExtractGzipTar(data []byte, destDir string) error {
-	gz, err := gzip.NewReader(newByteReader(data))
+	compressed := bytes.NewReader(data)
+	gz, err := gzip.NewReader(compressed)
 	if err != nil {
 		return fmt.Errorf("gzip: %w", err)
 	}
@@ -41,6 +43,13 @@ func ExtractGzipTar(data []byte, destDir string) error {
 	// accepting a truncated member after publishing a seemingly complete tar.
 	if _, err := io.Copy(io.Discard, gz); err != nil {
 		return fmt.Errorf("gzip: %w", err)
+	}
+	if compressed.Len() > 0 {
+		tail := data[len(data)-compressed.Len():]
+		if next, err := gzip.NewReader(bytes.NewReader(tail)); err == nil {
+			_ = next.Close()
+			return fmt.Errorf("gzip: multiple members are unsupported")
+		}
 	}
 	return nil
 }
@@ -107,6 +116,9 @@ func Untar(r io.Reader, destDir string) error {
 		}
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
+		}
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
+			continue
 		}
 		target, err := safeArchivePath(hdr.Name)
 		if err != nil {
@@ -182,7 +194,9 @@ func Untar(r io.Reader, destDir string) error {
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported tar entry type %q for %q", hdr.Typeflag, hdr.Name)
+			// Device nodes, FIFOs and other entries that are not useful for
+			// static analysis are deliberately not materialised.
+			continue
 		}
 	}
 }

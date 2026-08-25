@@ -93,6 +93,54 @@ func TestExtractAllWritesSafeTree(t *testing.T) {
 	}
 }
 
+func TestExtractAllSkipsUnreadableFileData(t *testing.T) {
+	fs := openWithBlockReadFailure(t, fakeExt2(t), smallFileBlock)
+	dest := filepath.Join(t.TempDir(), "output")
+	if err := fs.ExtractAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "small.txt")); !os.IsNotExist(err) {
+		t.Fatalf("unreadable file was materialised: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "subdir", "nested.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, nestedContent) {
+		t.Fatalf("later readable file = %q", got)
+	}
+}
+
+func TestExtractAllSkipsUnreadableNonDirectoryInode(t *testing.T) {
+	img := fakeExt2(t)
+	inodeOffset := int64(testInodeTblBlock*testBlockSize + int(inoSmall-1)*128)
+	fs, err := OpenAt(failingReaderAt{
+		reader:    bytes.NewReader(img),
+		failStart: inodeOffset,
+		failEnd:   inodeOffset + 128,
+	}, int64(len(img)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "output")
+	if err := fs.ExtractAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "small.txt")); !os.IsNotExist(err) {
+		t.Fatalf("unreadable inode was materialised: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "subdir", "nested.txt")); err != nil {
+		t.Fatalf("later readable file was not extracted: %v", err)
+	}
+}
+
+func TestExtractAllRejectsDirectoryReadFailure(t *testing.T) {
+	fs := openWithBlockReadFailure(t, fakeExt2(t), rootDirBlock)
+	if err := fs.ExtractAll(filepath.Join(t.TempDir(), "output")); err == nil {
+		t.Fatal("expected a directory read failure to remain fatal")
+	}
+}
+
 func TestExtractAllRebasesAbsoluteSymlink(t *testing.T) {
 	img := fakeExt2(t)
 	addFastSymlink(t, img, "absolute-link", "/small.txt")

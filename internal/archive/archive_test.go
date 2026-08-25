@@ -153,6 +153,24 @@ func TestExtractGzipTarAllowsTrailingData(t *testing.T) {
 	}
 }
 
+func TestExtractGzipTarRejectsSecondMember(t *testing.T) {
+	firstTar := buildTar(t, []testFile{{"first", "first member"}})
+	secondTar := buildTar(t, []testFile{{"second", "second member"}})
+	var compressed bytes.Buffer
+	for _, payload := range [][]byte{firstTar, secondTar} {
+		gw := gzip.NewWriter(&compressed)
+		if _, err := gw.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ExtractGzipTar(compressed.Bytes(), t.TempDir()); err == nil {
+		t.Fatal("expected a second gzip member to be rejected")
+	}
+}
+
 func TestExtractXZTar(t *testing.T) {
 	tarData := buildTar(t, []testFile{{"./bin/init", "#!/bin/fake\n"}})
 	var xzBuf bytes.Buffer
@@ -448,16 +466,48 @@ func TestUntarRejectsUnsafeHardLinkTarget(t *testing.T) {
 	}
 }
 
-func TestUntarRejectsUnsupportedEntryTypes(t *testing.T) {
+func TestUntarSkipsNonMaterialisedEntryTypes(t *testing.T) {
 	for _, typeflag := range []byte{tar.TypeChar, tar.TypeBlock, tar.TypeFifo, tar.TypeCont} {
 		t.Run(string([]byte{typeflag}), func(t *testing.T) {
-			tarData := buildTarEntries(t, []testTarEntry{{
-				header: tar.Header{Name: "unsupported", Typeflag: typeflag, Mode: 0o600},
-			}})
-			if err := Untar(bytes.NewReader(tarData), t.TempDir()); err == nil {
-				t.Fatalf("expected tar type %q to fail", typeflag)
+			tarData := buildTarEntries(t, []testTarEntry{
+				{header: tar.Header{Name: "unsupported", Typeflag: typeflag, Mode: 0o600}},
+				{header: tar.Header{Name: "later", Typeflag: tar.TypeReg, Mode: 0o600}, body: []byte("complete")},
+			})
+			dest := t.TempDir()
+			if err := Untar(bytes.NewReader(tarData), dest); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(dest, "later"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "complete" {
+				t.Fatalf("later entry = %q", got)
 			}
 		})
+	}
+}
+
+func TestUntarSkipsPAXGlobalHeaderBeforePathValidation(t *testing.T) {
+	tarData := buildTarEntries(t, []testTarEntry{
+		{header: tar.Header{
+			Name:       "../GlobalHead.0.0",
+			Typeflag:   tar.TypeXGlobalHeader,
+			Format:     tar.FormatPAX,
+			PAXRecords: map[string]string{"comment": "synthetic"},
+		}},
+		{header: tar.Header{Name: "later", Typeflag: tar.TypeReg, Mode: 0o600}, body: []byte("complete")},
+	})
+	dest := t.TempDir()
+	if err := Untar(bytes.NewReader(tarData), dest); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "later"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "complete" {
+		t.Fatalf("later entry = %q", got)
 	}
 }
 

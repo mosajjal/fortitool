@@ -62,6 +62,17 @@ func (s *stagedOutputDir) Commit() error {
 	return nil
 }
 
+func renamePortable(oldPath, newPath string) error {
+	if _, err := os.Lstat(newPath); err == nil {
+		return fmt.Errorf("output path already exists: %s", newPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	// Platforms without an atomic no-replace rename retain the historical
+	// best-effort check. A concurrent creator can still race this operation.
+	return os.Rename(oldPath, newPath)
+}
+
 func (s *stagedOutputDir) Cleanup() {
 	if s != nil && s.temp != "" {
 		_ = os.RemoveAll(s.temp)

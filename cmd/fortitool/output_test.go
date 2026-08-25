@@ -80,6 +80,42 @@ func TestCmdUnpackPublishesCompleteTree(t *testing.T) {
 	}
 }
 
+func TestCmdUnpackRejectsSecondGzipMemberWithoutPublication(t *testing.T) {
+	var compressed bytes.Buffer
+	for _, name := range []string{"first", "second"} {
+		var archive bytes.Buffer
+		tw := tar.NewWriter(&archive)
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		zw := gzip.NewWriter(&compressed)
+		if _, err := zw.Write(archive.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := t.TempDir()
+	input := filepath.Join(dir, "multi.tar.gz")
+	output := filepath.Join(dir, "output")
+	if err := os.WriteFile(input, compressed.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdUnpack(context.Background(), []string{"-o", output, input}); err == nil {
+		t.Fatal("expected a second gzip member to be rejected")
+	}
+	if _, err := os.Lstat(output); !os.IsNotExist(err) {
+		t.Fatalf("partial output was published: %v", err)
+	}
+}
+
 func TestGunzipOuterRejectsTruncatedGzip(t *testing.T) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
@@ -273,6 +309,53 @@ func TestStagedOutputCommitRejectsRacedDestination(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("raced destination was replaced: %v", entries)
+	}
+}
+
+func TestRenamePortablePublishesNewDirectory(t *testing.T) {
+	parent := t.TempDir()
+	oldPath := filepath.Join(parent, "staged")
+	newPath := filepath.Join(parent, "published")
+	if err := os.Mkdir(oldPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldPath, "file"), []byte("complete"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := renamePortable(oldPath, newPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(newPath, "file"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "complete" {
+		t.Fatalf("published content = %q", got)
+	}
+}
+
+func TestRenamePortableRejectsExistingPath(t *testing.T) {
+	parent := t.TempDir()
+	oldPath := filepath.Join(parent, "staged")
+	newPath := filepath.Join(parent, "published")
+	if err := os.Mkdir(oldPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(newPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := renamePortable(oldPath, newPath); err == nil {
+		t.Fatal("expected existing destination to be rejected")
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("staged directory changed after collision: %v", err)
+	}
+	entries, err := os.ReadDir(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("existing destination changed: %v", entries)
 	}
 }
 
