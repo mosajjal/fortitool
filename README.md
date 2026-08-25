@@ -53,7 +53,9 @@ permute argv the way getopt does.
 `decrypt` and `unpack` publish a completed tree only when the requested
 output directory does not already exist. Linux uses an atomic no-replace
 rename; other platforms perform a best-effort existence check before the
-rename. Archive and filesystem symlinks with absolute targets are rewritten
+rename. Staged trees and standalone decrypted files are private to the
+invoking identity: mode 0700 or 0600 on Unix, and a protected per-user DACL
+on Windows. Archive and filesystem symlinks with absolute targets are rewritten
 as confined relative links, so extracted links remain inside the output tree
 rather than referring to paths on the host.
 

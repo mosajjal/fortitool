@@ -23,6 +23,8 @@ func formatRootfsKeyDetail(detail string, show bool) string {
 type stagedOutputDir struct {
 	final          string
 	temp           string
+	closeTemp      func() error
+	releaseThread  func()
 	createdParents []string
 }
 
@@ -40,23 +42,25 @@ func newStagedOutputDir(final string) (*stagedOutputDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	temp, err := os.MkdirTemp(parent, "."+filepath.Base(final)+".tmp-")
+	temp, closeTemp, releaseThread, err := createPrivateTempDir(parent, "."+filepath.Base(final)+".tmp-")
 	if err != nil {
 		removeCreatedParents(createdParents)
 		return nil, err
 	}
-	if err := os.Chmod(temp, 0o700); err != nil {
-		_ = os.RemoveAll(temp)
-		removeCreatedParents(createdParents)
-		return nil, err
-	}
-	return &stagedOutputDir{final: final, temp: temp, createdParents: createdParents}, nil
+	return &stagedOutputDir{final: final, temp: temp, closeTemp: closeTemp, releaseThread: releaseThread, createdParents: createdParents}, nil
 }
 
 func (s *stagedOutputDir) Commit() error {
+	if s.closeTemp != nil {
+		if err := s.closeTemp(); err != nil {
+			return fmt.Errorf("closing staged output directory: %w", err)
+		}
+		s.closeTemp = nil
+	}
 	if err := renameNew(s.temp, s.final); err != nil {
 		return fmt.Errorf("publishing output directory: %w", err)
 	}
+	s.releaseTempThread()
 	s.temp = ""
 	s.createdParents = nil
 	return nil
@@ -74,12 +78,26 @@ func renamePortable(oldPath, newPath string) error {
 }
 
 func (s *stagedOutputDir) Cleanup() {
+	if s != nil && s.closeTemp != nil {
+		_ = s.closeTemp()
+		s.closeTemp = nil
+	}
 	if s != nil && s.temp != "" {
 		_ = os.RemoveAll(s.temp)
 	}
 	if s != nil {
+		s.releaseTempThread()
+	}
+	if s != nil {
 		removeCreatedParents(s.createdParents)
 		s.createdParents = nil
+	}
+}
+
+func (s *stagedOutputDir) releaseTempThread() {
+	if s.releaseThread != nil {
+		s.releaseThread()
+		s.releaseThread = nil
 	}
 }
 
@@ -94,7 +112,7 @@ func writeNewFile(name string, data []byte, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(parent, "."+filepath.Base(name)+".tmp-")
+	f, err := createPrivateTempFile(parent, "."+filepath.Base(name)+".tmp-", mode)
 	if err != nil {
 		removeCreatedParents(createdParents)
 		return err
@@ -104,10 +122,6 @@ func writeNewFile(name string, data []byte, mode os.FileMode) error {
 		_ = os.Remove(temp)
 		removeCreatedParents(createdParents)
 	}()
-	if err := f.Chmod(mode); err != nil {
-		_ = f.Close()
-		return err
-	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		return err
@@ -116,13 +130,8 @@ func writeNewFile(name string, data []byte, mode os.FileMode) error {
 		_ = f.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := publishPrivateTempFile(f, temp, name); err != nil {
 		return err
-	}
-	// Publishing with a hard link is atomic and fails if another process
-	// creates the destination between the Lstat above and this point.
-	if err := os.Link(temp, name); err != nil {
-		return fmt.Errorf("publishing output file: %w", err)
 	}
 	createdParents = nil
 	return nil

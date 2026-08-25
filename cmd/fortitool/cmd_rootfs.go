@@ -55,7 +55,8 @@ OUTPUT
   Prints which crypto family/cipher matched and whether the embedded
   SHA-256 hash check passed, then writes the decrypted rootfs.gz (still
   gzip-compressed tar -- pipe it to 'fortitool unpack' to extract it).
-  The standalone decrypted file is private by default (mode 0600).
+  The standalone decrypted file is private to the invoking identity: mode 0600
+  on Unix and a protected per-user DACL on Windows.
 
 EXIT CODES
   0  decrypted (or was already plain gzip -- check stdout for which)

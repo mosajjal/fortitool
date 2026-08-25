@@ -53,3 +53,5 @@ parser doesn't permute argv).
   for compatibility; do not combine input sources.
 - Exit code 0 = succeeded (including "already cleartext" / recognized
   unsupported cases where relevant); 1 = failed; 2 = usage error.
+- Decrypted files and staged output trees are private to the invoking identity:
+  mode 0600 or 0700 on Unix, and a protected per-user DACL on Windows.

@@ -71,13 +71,7 @@ func TestCmdUnpackPublishesCompleteTree(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("published payload = %q", got)
 	}
-	info, err := os.Stat(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("published tree mode = %04o, want 0700", got)
-	}
+	assertPrivateDirectory(t, output)
 }
 
 func TestCmdUnpackRejectsSecondGzipMemberWithoutPublication(t *testing.T) {
@@ -246,13 +240,7 @@ func TestCmdL1PublishesPrivateStandaloneOutput(t *testing.T) {
 	if err := cmdL1(context.Background(), []string{"-o", output, input}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("standalone L1 output mode = %04o, want 0600", got)
-	}
+	assertPrivateFile(t, output)
 }
 
 func TestCmdRootfsPublishesValidatedPrivateStandaloneOutput(t *testing.T) {
@@ -277,13 +265,7 @@ func TestCmdRootfsPublishesValidatedPrivateStandaloneOutput(t *testing.T) {
 	if err := cmdRootfs(context.Background(), []string{"-o", output, flatkc, rootfs}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("standalone rootfs output mode = %04o, want 0600", got)
-	}
+	assertPrivateFile(t, output)
 }
 
 func TestStagedOutputCommitRejectsRacedDestination(t *testing.T) {

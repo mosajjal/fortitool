@@ -32,7 +32,8 @@ USAGE
 
 FLAGS
   -o OUTDIR   output directory (required; must not already exist; published
-              only after complete extraction, with private mode 0700)
+              only after complete extraction, private to the invoking identity:
+              mode 0700 on Unix and a protected per-user DACL on Windows)
 
 EXAMPLES
   fortitool unpack -o rootfs/ rootfs.gz.dec

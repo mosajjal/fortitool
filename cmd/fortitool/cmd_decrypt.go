@@ -47,7 +47,8 @@ USAGE
 
 FLAGS
   -o OUTDIR     output directory (required) -- must not already exist;
-                published only on success with private mode 0700
+                published only on success, private to the invoking identity
+                (mode 0700 on Unix; protected per-user DACL on Windows)
   --show-keys   print recovered key material (redacted by default)
 
 EXAMPLE

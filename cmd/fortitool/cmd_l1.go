@@ -69,7 +69,8 @@ EXAMPLES
 
 OUTPUT
   Reports whether a key was recovered (or the image was already cleartext),
-  then writes the decrypted image with private mode 0600. Use --show-keys only
+  then writes the decrypted image private to the invoking identity (mode 0600
+  on Unix; protected per-user DACL on Windows). Use --show-keys only
   in a suitably protected diagnostic session. The decrypted image still
   contains a raw MBR + ext3 volume -- use 'fortitool decrypt' for the full
   pipeline through to an unpacked rootfs, or read the ext3 volume yourself
