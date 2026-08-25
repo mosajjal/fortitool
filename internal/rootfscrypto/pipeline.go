@@ -93,9 +93,6 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 	bodyHash := sha256.Sum256(body)
 
 	if r := tryAESCTR(payload, body, bodyHash[:]); r != nil {
-		if !r.HashOK {
-			return nil, true
-		}
 		r.Seed = sm
 		return r, true
 	}
@@ -104,9 +101,6 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 		return r, true
 	}
 	if r := tryStreamCiphers(payload, body, bodyHash[:]); r != nil {
-		if !r.HashOK {
-			return nil, true
-		}
 		r.Seed = sm
 		return r, true
 	}
@@ -163,16 +157,14 @@ func tryAESCTR(payload, body, bodyHash []byte) *Result {
 		{"counter|aeskey|hash", payload[48:80], payload[0:16], payload[16:48]},
 	}
 	for _, l := range layouts {
-		if !bytes.Equal(l.hash, bodyHash) {
-			continue
-		}
+		hashOK := bytes.Equal(l.hash, bodyHash)
 		step := counterStep(l.ctr)
 		nonce := l.ctr[:8]
 		counter0 := getLE64(l.ctr[8:16])
 		plain := aesCustomCTR(l.aeskey, nonce, counter0, step, body)
 		if plausibleBody(plain) {
 			return &Result{
-				Plaintext: plain, Cipher: "aes-ctr", HashOK: true,
+				Plaintext: plain, Cipher: "aes-ctr", HashOK: hashOK,
 				KeyDetail: fmt.Sprintf("layout=%s aes_key=%x", l.name, l.aeskey),
 			}
 		}

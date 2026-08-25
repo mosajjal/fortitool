@@ -155,6 +155,52 @@ func TestDecryptRootfs_ChaChaFamily_AESCTR(t *testing.T) {
 	}
 }
 
+func TestDecryptRootfsAcceptsAESCTRWithMismatchedBodyHash(t *testing.T) {
+	key := genTestRSAKey(t)
+	kernel := make([]byte, 2048)
+	if _, err := rand.Read(kernel); err != nil {
+		t.Fatal(err)
+	}
+	embedXORCandidate(t, kernel, 256, key)
+
+	wantPlaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("rootfs-cpio-data"), 50)...)
+	aesKey := make([]byte, 32)
+	counter := make([]byte, 16)
+	if _, err := rand.Read(aesKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(counter); err != nil {
+		t.Fatal(err)
+	}
+	body := aesCustomCTR(aesKey, counter[:8], getLE64(counter[8:16]), counterStep(counter), wantPlaintext)
+
+	bodyHash := sha256.Sum256(body)
+	bodyHash[0] ^= 0xff
+	payload := make([]byte, 0, 80)
+	payload = append(payload, bodyHash[:]...)
+	payload = append(payload, counter...)
+	payload = append(payload, aesKey...)
+	modLen := (key.priv.N.BitLen() + 7) / 8
+	sig := signAsRSAPublicOp(pkcs1Wrap(payload, modLen), key.priv)
+
+	res, err := DecryptRootfs(context.Background(), kernel, append(body, sig...))
+	if err != nil {
+		t.Fatalf("DecryptRootfs: %v", err)
+	}
+	if !bytes.Equal(res.Plaintext, wantPlaintext) {
+		t.Fatal("plaintext mismatch")
+	}
+	if res.Cipher != "aes-ctr" {
+		t.Fatalf("cipher = %q, want aes-ctr", res.Cipher)
+	}
+	if res.HashOK {
+		t.Fatal("HashOK = true for a mismatched body hash")
+	}
+	if res.Seed.SeedOffset != 256 {
+		t.Fatalf("selected seed offset = %d, want 256", res.Seed.SeedOffset)
+	}
+}
+
 func TestDecryptRootfs_XORFamily_ModifiedRC4(t *testing.T) {
 	key := genTestRSAKey(t)
 
@@ -197,6 +243,35 @@ func TestDecryptRootfs_XORFamily_ModifiedRC4(t *testing.T) {
 	}
 	if res.Seed.Family != "xor" {
 		t.Fatalf("family = %q, want xor", res.Seed.Family)
+	}
+}
+
+func TestDecryptRootfsAcceptsModifiedRC4WithoutBodyHash(t *testing.T) {
+	key := genTestRSAKey(t)
+	kernel := make([]byte, 2048)
+	if _, err := rand.Read(kernel); err != nil {
+		t.Fatal(err)
+	}
+	embedXORCandidate(t, kernel, 256, key)
+
+	wantPlaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("rootfs-cpio-data"), 50)...)
+	rc4Key := make([]byte, 32)
+	if _, err := rand.Read(rc4Key); err != nil {
+		t.Fatal(err)
+	}
+	body := modifiedRC4(rc4Key, wantPlaintext, false)
+	modLen := (key.priv.N.BitLen() + 7) / 8
+	sig := signAsRSAPublicOp(pkcs1Wrap(rc4Key, modLen), key.priv)
+
+	res, err := DecryptRootfs(context.Background(), kernel, append(body, sig...))
+	if err != nil {
+		t.Fatalf("DecryptRootfs: %v", err)
+	}
+	if !bytes.Equal(res.Plaintext, wantPlaintext) {
+		t.Fatal("plaintext mismatch")
+	}
+	if res.HashOK {
+		t.Fatal("HashOK = true without a body hash in the signature payload")
 	}
 }
 
@@ -249,6 +324,10 @@ func TestFindSeedMaterialsDeterministicOrder(t *testing.T) {
 		if materials[0].SeedOffset != 256 || materials[1].SeedOffset != 1024 {
 			t.Fatalf("scan %d offsets = [%d, %d], want [256, 1024]",
 				i, materials[0].SeedOffset, materials[1].SeedOffset)
+		}
+		material := FindSeedMaterial(context.Background(), kernel)
+		if material == nil || material.SeedOffset != 256 {
+			t.Fatalf("FindSeedMaterial = %v, want seed offset 256", material)
 		}
 	}
 }
@@ -420,12 +499,16 @@ func TestPKCS1UnwrapRejectsMissingAndShortPadding(t *testing.T) {
 	}
 }
 
-func TestTryAESCTRRequiresMatchingBodyHash(t *testing.T) {
+func TestTryAESCTRReportsMismatchedBodyHash(t *testing.T) {
 	payload := make([]byte, 80)
 	plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte{0x42}, 64)...)
 	body := aesCustomCTR(payload[48:80], payload[32:40], 0, counterStep(payload[32:48]), plaintext)
 	bodyHash := bytes.Repeat([]byte{0x42}, sha256.Size)
-	if result := tryAESCTR(payload, body, bodyHash); result != nil {
-		t.Fatalf("accepted AES layout with mismatched body hash: %+v", result)
+	result := tryAESCTR(payload, body, bodyHash)
+	if result == nil {
+		t.Fatal("expected a plausible AES plaintext despite the mismatched body hash")
+	}
+	if result.HashOK {
+		t.Fatal("HashOK = true for a mismatched body hash")
 	}
 }

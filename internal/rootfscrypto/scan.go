@@ -227,6 +227,8 @@ func scanChaChaFamily(ctx context.Context, data []byte) []*SeedMaterial {
 	if workers < 1 {
 		workers = 1
 	}
+	// Ambiguity detection requires every worker to finish rather than cancelling
+	// the scan after the first valid candidate.
 	result := make(chan *SeedMaterial)
 	var wg sync.WaitGroup
 	chunk := (numSeedOffsets + workers - 1) / workers
@@ -310,6 +312,16 @@ func FindSeedMaterials(ctx context.Context, kernelPayload []byte) []*SeedMateria
 		return nil
 	}
 	return scanChaChaFamily(ctx, kernelPayload)
+}
+
+// FindSeedMaterial returns the first structurally valid candidate in
+// deterministic offset order.
+func FindSeedMaterial(ctx context.Context, kernelPayload []byte) *SeedMaterial {
+	candidates := FindSeedMaterials(ctx, kernelPayload)
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
 }
 
 func sortSeedMaterials(materials []*SeedMaterial) {
