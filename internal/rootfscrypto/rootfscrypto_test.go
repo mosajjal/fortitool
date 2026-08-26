@@ -86,6 +86,17 @@ func embedXORCandidate(t *testing.T, kernel []byte, offset int, key testRSAKey) 
 	return seed
 }
 
+func embedChaChaCandidate(t *testing.T, kernel []byte, seedOffset, blobOffset int, key testRSAKey, split [2]int) []byte {
+	t.Helper()
+	seed := make([]byte, seedLen)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	copy(kernel[seedOffset:seedOffset+seedLen], seed)
+	copy(kernel[blobOffset:blobOffset+blobLen], chacha20Decrypt(seed, split[0], split[1], key.der))
+	return seed
+}
+
 func buildModifiedRC4Rootfs(t *testing.T, key testRSAKey) ([]byte, []byte) {
 	t.Helper()
 	plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("synthetic-rootfs"), 64)...)
@@ -108,7 +119,7 @@ func TestDecryptRootfs_ChaChaFamily_AESCTR(t *testing.T) {
 	if _, err := rand.Read(seed); err != nil {
 		t.Fatal(err)
 	}
-	split := chachaSplits[0] // (5,2), the FSoC3/ARM finding this repo made
+	split := chachaKeySplits[0] // (5,2), the FSoC3/ARM finding this repo made
 	encBlob := chacha20Decrypt(seed, split[0], split[1], key.der)
 
 	kernelPayload := make([]byte, 4096)
@@ -290,7 +301,7 @@ func TestFindSeedMaterialChaChaSeedAtFinalAlignedOffset(t *testing.T) {
 	if _, err := rand.Read(seed); err != nil {
 		t.Fatal(err)
 	}
-	split := chachaSplits[0]
+	split := chachaKeySplits[0]
 	encBlob := chacha20Decrypt(seed, split[0], split[1], key.der)
 
 	kernelPayload := make([]byte, 304)
@@ -304,6 +315,80 @@ func TestFindSeedMaterialChaChaSeedAtFinalAlignedOffset(t *testing.T) {
 	if materials[0].SeedOffset != len(kernelPayload)-seedLen {
 		t.Fatalf("seed offset = %d, want %d", materials[0].SeedOffset, len(kernelPayload)-seedLen)
 	}
+}
+
+func TestFindSeedMaterialsChaChaSplitSixThree(t *testing.T) {
+	split := [2]int{6, 3}
+
+	t.Run("contiguous", func(t *testing.T) {
+		key := genTestRSAKey(t)
+		kernel := make([]byte, 1024)
+		embedChaChaCandidate(t, kernel, 128, 160, key, split)
+
+		materials := scanChaChaFamily(context.Background(), kernel)
+		if len(materials) != 1 {
+			t.Fatalf("found %d seed materials, want 1", len(materials))
+		}
+		if materials[0].SeedOffset != 128 || materials[0].BlobOffset != 160 ||
+			materials[0].KeySplit != 6 || materials[0].IVSplit != 3 {
+			t.Fatalf("material = %+v, want seed 128, blob 160, split (6,3)", materials[0])
+		}
+
+		plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("rootfs-cpio-data"), 50)...)
+		body := chacha20Decrypt(materials[0].Seed, split[0], split[1], plaintext)
+		if result := tryChaCha20Body(materials[0], body, nil); result != nil {
+			t.Fatalf("(6,3) RSA discovery also enabled body probing: %+v", result)
+		}
+	})
+
+	t.Run("aligned-gap", func(t *testing.T) {
+		key := genTestRSAKey(t)
+		kernel := make([]byte, 1024)
+		embedChaChaCandidate(t, kernel, 544, 256, key, split)
+
+		materials := scanChaChaFamily(context.Background(), kernel)
+		if len(materials) != 1 {
+			t.Fatalf("found %d seed materials, want 1", len(materials))
+		}
+		if materials[0].SeedOffset != 544 || materials[0].BlobOffset != 256 {
+			t.Fatalf("offsets = (%d,%d), want (544,256)", materials[0].SeedOffset, materials[0].BlobOffset)
+		}
+	})
+
+	t.Run("malformed", func(t *testing.T) {
+		key := genTestRSAKey(t)
+		kernel := make([]byte, 1024)
+		seed := embedChaChaCandidate(t, kernel, 128, 160, key, split)
+		malformed := append([]byte(nil), key.der...)
+		malformed[len(malformed)-1] ^= 0xff
+		copy(kernel[160:160+blobLen], chacha20Decrypt(seed, split[0], split[1], malformed))
+
+		if materials := scanChaChaFamily(context.Background(), kernel); len(materials) != 0 {
+			t.Fatalf("found %d seed materials, want 0", len(materials))
+		}
+	})
+
+	t.Run("zero", func(t *testing.T) {
+		if materials := scanChaChaFamily(context.Background(), make([]byte, 1024)); len(materials) != 0 {
+			t.Fatalf("found %d seed materials, want 0", len(materials))
+		}
+	})
+
+	t.Run("multiple", func(t *testing.T) {
+		first := genTestRSAKey(t)
+		second := genTestRSAKey(t)
+		kernel := make([]byte, 2048)
+		if _, err := rand.Read(kernel); err != nil {
+			t.Fatal(err)
+		}
+		embedChaChaCandidate(t, kernel, 128, 160, first, split)
+		embedChaChaCandidate(t, kernel, 1536, 1024, second, split)
+
+		materials := scanChaChaFamily(context.Background(), kernel)
+		if len(materials) != 2 {
+			t.Fatalf("found %d seed materials, want 2", len(materials))
+		}
+	})
 }
 
 func TestFindSeedMaterialsDeterministicOrder(t *testing.T) {

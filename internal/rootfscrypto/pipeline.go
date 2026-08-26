@@ -108,6 +108,9 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 	return nil, true
 }
 
+// chachaBodySplits contains only splits observed for rootfs body encryption.
+var chachaBodySplits = [][2]int{{5, 2}, {4, 5}, {3, 1}, {5, 5}, {2, 5}, {1, 3}, {3, 2}, {4, 2}, {5, 3}, {2, 3}}
+
 // tryChaCha20Body handles the 7.4.1-7.4.3 era (Bishop Fox "Further
 // Adventures", Optistream fortigate-crypto): the rootfs body itself is
 // ChaCha20-encrypted with key = SHA256(rot_k(seed)) and 16-byte IV =
@@ -119,7 +122,7 @@ func tryChaCha20Body(sm *SeedMaterial, body, bodyHash []byte) *Result {
 	if probeLen > len(body) {
 		probeLen = len(body)
 	}
-	for _, split := range chachaSplits {
+	for _, split := range chachaBodySplits {
 		ks := chacha20Keystream(sm.Seed, split[0], split[1], probeLen)
 		probe := make([]byte, probeLen)
 		for i := range probe {
