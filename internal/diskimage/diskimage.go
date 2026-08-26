@@ -12,12 +12,18 @@ package diskimage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
+
+// ErrNotFound distinguishes an optional absent filesystem member from a
+// malformed or unreadable filesystem entry.
+var ErrNotFound = errors.New("diskimage: file not found")
 
 const (
 	superblockOffset = 1024
@@ -86,8 +92,12 @@ type readerSource struct {
 
 func (s readerSource) size() int64 { return s.sz }
 func (s readerSource) at(p []byte, off int64) error {
-	if _, err := s.r.ReadAt(p, off); err != nil {
+	n, err := s.r.ReadAt(p, off)
+	if err != nil {
 		return fmt.Errorf("diskimage: read at %d (%d bytes): %w", off, len(p), err)
+	}
+	if n != len(p) {
+		return fmt.Errorf("diskimage: read at %d returned %d of %d bytes: %w", off, n, len(p), io.ErrUnexpectedEOF)
 	}
 	return nil
 }
@@ -225,29 +235,36 @@ func (f *FS) readInode(num uint32) (*inode, error) {
 func (f *FS) isDir(in *inode) bool { return in.mode&s_IFMT == s_IFDIR }
 func (f *FS) isReg(in *inode) bool { return in.mode&s_IFMT == s_IFREG }
 
-func (f *FS) readBlock(num uint32) []byte {
+func (f *FS) readBlock(num uint32) ([]byte, error) {
 	buf := make([]byte, f.sb.blockSize)
 	if num == 0 {
-		return buf // sparse hole
+		return buf, nil // sparse hole
+	}
+	if num >= f.sb.blocksCount {
+		return nil, fmt.Errorf("diskimage: block %d is outside filesystem block count %d", num, f.sb.blocksCount)
 	}
 	off := uint64(num) * uint64(f.sb.blockSize)
-	if off >= uint64(f.src.size()) {
-		return buf
+	sourceSize := uint64(f.src.size())
+	if off > sourceSize || uint64(f.sb.blockSize) > sourceSize-off {
+		return nil, fmt.Errorf("diskimage: block %d at offset %d runs past end of image (%d bytes)", num, off, sourceSize)
 	}
 	if err := f.src.at(buf, int64(off)); err != nil {
-		return buf // treat unreadable tail as a hole; callers bound by file size
+		return nil, fmt.Errorf("diskimage: reading block %d: %w", num, err)
 	}
-	return buf
+	return buf, nil
 }
 
-func (f *FS) blockPointers(blockNum uint32) []uint32 {
-	raw := f.readBlock(blockNum)
+func (f *FS) blockPointers(blockNum uint32) ([]uint32, error) {
+	raw, err := f.readBlock(blockNum)
+	if err != nil {
+		return nil, err
+	}
 	n := len(raw) / 4
 	ptrs := make([]uint32, n)
 	for i := 0; i < n; i++ {
 		ptrs[i] = binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
 	}
-	return ptrs
+	return ptrs, nil
 }
 
 // extentMagic is the ext4 extent-tree header magic (0xF30A, little-endian
@@ -309,11 +326,9 @@ func (f *FS) collectExtents(root []byte) ([]extent, error) {
 		idx := root[headerSize+i*12 : headerSize+(i+1)*12]
 		// index entry: ei_block(4) ei_leaf_lo(4) ei_leaf_hi(2) unused(2)
 		leafBlock := uint64ToBlock(binary.LittleEndian.Uint16(idx[8:10]), binary.LittleEndian.Uint32(idx[4:8]))
-		node := make([]byte, f.sb.blockSize)
-		if leafBlock != 0 {
-			if err := f.src.at(node, int64(uint64(leafBlock)*uint64(f.sb.blockSize))); err != nil {
-				return nil, fmt.Errorf("diskimage: reading extent index node at block %d: %w", leafBlock, err)
-			}
+		node, err := f.readBlock(leafBlock)
+		if err != nil {
+			return nil, fmt.Errorf("diskimage: reading extent index node at block %d: %w", leafBlock, err)
 		}
 		sub, err := f.collectExtents(node)
 		if err != nil {
@@ -373,7 +388,15 @@ func (f *FS) readInodeDataExtents(num uint32, in *inode) ([]byte, error) {
 			if e.uninit || e.physical == 0 {
 				out = append(out, make([]byte, blockSize)...)
 			} else {
-				out = append(out, f.readBlock(e.physical+i)...)
+				blockNum := uint64(e.physical) + uint64(i)
+				if blockNum > uint64(^uint32(0)) {
+					return nil, fmt.Errorf("diskimage: inode %d extent block number overflows", num)
+				}
+				block, err := f.readBlock(uint32(blockNum))
+				if err != nil {
+					return nil, fmt.Errorf("diskimage: inode %d extent data: %w", num, err)
+				}
+				out = append(out, block...)
 			}
 			written++
 		}
@@ -410,12 +433,17 @@ func (f *FS) readInodeDataIndirect(num uint32, in *inode) ([]byte, error) {
 	out := make([]byte, 0, size+blockSize)
 	var written uint64
 
-	appendBlock := func(b uint32) {
+	appendBlock := func(b uint32) error {
 		if written >= needed {
-			return
+			return nil
 		}
-		out = append(out, f.readBlock(b)...)
+		block, err := f.readBlock(b)
+		if err != nil {
+			return err
+		}
+		out = append(out, block...)
 		written++
+		return nil
 	}
 	appendHole := func(n uint64) {
 		if written >= needed {
@@ -430,16 +458,24 @@ func (f *FS) readInodeDataIndirect(num uint32, in *inode) ([]byte, error) {
 	}
 
 	for i := 0; i < nDirect && written < needed; i++ {
-		appendBlock(in.block[i])
+		if err := appendBlock(in.block[i]); err != nil {
+			return nil, fmt.Errorf("diskimage: inode %d direct data: %w", num, err)
+		}
 	}
 
 	if written < needed {
 		if in.block[iBlockSingle] != 0 {
-			for _, b := range f.blockPointers(in.block[iBlockSingle]) {
+			ptrs, err := f.blockPointers(in.block[iBlockSingle])
+			if err != nil {
+				return nil, fmt.Errorf("diskimage: inode %d single-indirect block: %w", num, err)
+			}
+			for _, b := range ptrs {
 				if written >= needed {
 					break
 				}
-				appendBlock(b)
+				if err := appendBlock(b); err != nil {
+					return nil, fmt.Errorf("diskimage: inode %d single-indirect data: %w", num, err)
+				}
 			}
 		} else {
 			appendHole(ptrsPerBlock)
@@ -448,7 +484,11 @@ func (f *FS) readInodeDataIndirect(num uint32, in *inode) ([]byte, error) {
 
 	if written < needed {
 		if in.block[iBlockDouble] != 0 {
-			for _, indBlock := range f.blockPointers(in.block[iBlockDouble]) {
+			outer, err := f.blockPointers(in.block[iBlockDouble])
+			if err != nil {
+				return nil, fmt.Errorf("diskimage: inode %d double-indirect block: %w", num, err)
+			}
+			for _, indBlock := range outer {
 				if written >= needed {
 					break
 				}
@@ -456,11 +496,17 @@ func (f *FS) readInodeDataIndirect(num uint32, in *inode) ([]byte, error) {
 					appendHole(ptrsPerBlock)
 					continue
 				}
-				for _, b := range f.blockPointers(indBlock) {
+				inner, err := f.blockPointers(indBlock)
+				if err != nil {
+					return nil, fmt.Errorf("diskimage: inode %d double-indirect child: %w", num, err)
+				}
+				for _, b := range inner {
 					if written >= needed {
 						break
 					}
-					appendBlock(b)
+					if err := appendBlock(b); err != nil {
+						return nil, fmt.Errorf("diskimage: inode %d double-indirect data: %w", num, err)
+					}
 				}
 			}
 		} else {
@@ -514,15 +560,21 @@ func (f *FS) readDirEntries(dirInodeNum uint32) ([]DirEntry, error) {
 			nameLen := data[off+6]
 			fileType := data[off+7]
 			if recLen == 0 {
-				break
+				return nil, fmt.Errorf("diskimage: directory inode %d has corrupt entry at offset %d (zero record length)", dirInodeNum, off)
+			}
+			if recLen < dirEntryHeaderSize || off+int(recLen) > blockEnd {
+				return nil, fmt.Errorf("diskimage: directory inode %d has corrupt entry at offset %d (invalid record length %d)", dirInodeNum, off, recLen)
 			}
 			nameEnd := off + dirEntryHeaderSize + int(nameLen)
-			if nameEnd > blockEnd {
-				return nil, fmt.Errorf("diskimage: directory inode %d has corrupt entry at offset %d (name overruns block)", dirInodeNum, off)
+			if nameEnd > off+int(recLen) {
+				return nil, fmt.Errorf("diskimage: directory inode %d has corrupt entry at offset %d (name overruns record)", dirInodeNum, off)
 			}
 			if entInode != 0 {
 				name := string(data[off+dirEntryHeaderSize : nameEnd])
 				if name != "." && name != ".." {
+					if err := validateEntryName(name); err != nil {
+						return nil, fmt.Errorf("diskimage: directory inode %d: %w", dirInodeNum, err)
+					}
 					isDir := fileType == 2
 					var size uint64
 					if !isDir {
@@ -545,6 +597,9 @@ func (f *FS) readDirEntries(dirInodeNum uint32) ([]DirEntry, error) {
 				}
 			}
 			off += int(recLen)
+		}
+		if off != blockEnd {
+			return nil, fmt.Errorf("diskimage: directory inode %d has a truncated entry header at offset %d", dirInodeNum, off)
 		}
 	}
 	return entries, nil
@@ -581,7 +636,7 @@ func (f *FS) resolve(path string) (uint32, error) {
 			if walked == "" {
 				walked = "/"
 			}
-			return 0, fmt.Errorf("diskimage: %q not found under %q (resolving %q)", part, walked, path)
+			return 0, fmt.Errorf("%w: %q under %q (resolving %q)", ErrNotFound, part, walked, path)
 		}
 		walked = walked + "/" + part
 	}
@@ -633,54 +688,119 @@ func (f *FS) ReadDir(path string) ([]DirEntry, error) {
 // and symlinks) under destDir. It exists for rootfs payloads that are
 // filesystem images rather than tar archives (FortiOS 8.0 VM images).
 func (f *FS) ExtractAll(destDir string) error {
-	return f.extractDir("", destDir)
+	info, err := os.Lstat(destDir)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(destDir, 0o755); err != nil {
+			return err
+		}
+		info, err = os.Lstat(destDir)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("diskimage: extraction destination is not a real directory: %q", destDir)
+	}
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	visited := map[uint32]string{rootInode: "/"}
+	return f.extractDir("", "", root, visited)
 }
 
-func (f *FS) extractDir(relPath, destDir string) error {
+func (f *FS) extractDir(relPath, destPath string, root *os.Root, visited map[uint32]string) error {
 	entries, err := f.ReadDir(relPath)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return err
-	}
 	for _, e := range entries {
+		if err := validateEntryName(e.Name); err != nil {
+			return err
+		}
 		childRel := e.Name
 		if relPath != "" {
 			childRel = relPath + "/" + e.Name
 		}
-		target := filepath.Join(destDir, e.Name)
+		target := filepath.Join(destPath, e.Name)
 		if e.IsDir {
-			if err := f.extractDir(childRel, target); err != nil {
+			if previous, ok := visited[e.Inode]; ok {
+				return fmt.Errorf("diskimage: directory %q reuses inode %d already visited at %q", childRel, e.Inode, previous)
+			}
+			visited[e.Inode] = childRel
+			if err := root.Mkdir(target, 0o755); err != nil {
+				return fmt.Errorf("diskimage: creating directory %q: %w", childRel, err)
+			}
+			if err := f.extractDir(childRel, target, root, visited); err != nil {
 				return err
 			}
 			continue
 		}
 		in, err := f.readInode(e.Inode)
 		if err != nil {
-			continue // unreadable entry: skip rather than abort the dump
+			continue
 		}
 		switch in.mode & s_IFMT {
 		case s_IFREG:
-			data, err := f.ReadFile(childRel)
+			data, err := f.readInodeData(e.Inode, in)
 			if err != nil {
 				continue
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
+			out, err := root.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+			if err != nil {
+				return fmt.Errorf("diskimage: creating %q: %w", childRel, err)
 			}
-			if err := os.WriteFile(target, data, 0o644); err != nil {
+			if _, err := out.Write(data); err != nil {
+				_ = out.Close()
+				_ = root.Remove(target)
+				return fmt.Errorf("diskimage: writing %q: %w", childRel, err)
+			}
+			if err := out.Close(); err != nil {
+				_ = root.Remove(target)
 				return err
 			}
 		case s_IFLNK:
 			targetBytes, err := f.readInodeFast(e.Inode)
-			if err == nil && len(targetBytes) > 0 {
-				_ = os.Remove(target)
-				_ = os.Symlink(string(targetBytes), target)
+			if err != nil {
+				continue
 			}
+			linkTarget, err := safeExtractSymlinkTarget(target, string(targetBytes))
+			if err != nil {
+				return err
+			}
+			if err := root.Symlink(linkTarget, target); err != nil {
+				return fmt.Errorf("diskimage: creating symlink %q: %w", childRel, err)
+			}
+		default:
+			// Device nodes and FIFOs are intentionally not materialised.
 		}
 	}
 	return nil
+}
+
+func validateEntryName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") {
+		return fmt.Errorf("unsafe filesystem entry name %q", name)
+	}
+	return nil
+}
+
+func safeExtractSymlinkTarget(linkName, linkTarget string) (string, error) {
+	if linkTarget == "" || strings.ContainsRune(linkTarget, '\x00') {
+		return "", fmt.Errorf("diskimage: symlink %q has an invalid target", linkName)
+	}
+	linkName = filepath.ToSlash(linkName)
+	target := strings.ReplaceAll(linkTarget, `\`, "/")
+	if path.IsAbs(target) {
+		target = strings.TrimPrefix(path.Clean(target), "/")
+	} else {
+		target = path.Clean(path.Join(path.Dir(linkName), target))
+	}
+	if target == ".." || strings.HasPrefix(target, "../") {
+		return "", fmt.Errorf("diskimage: symlink %q escapes destination: %q", linkName, linkTarget)
+	}
+	return filepath.Rel(filepath.FromSlash(path.Dir(linkName)), filepath.FromSlash(target))
 }
 
 // readInodeFast returns an inode's raw content bytes (fast symlink targets

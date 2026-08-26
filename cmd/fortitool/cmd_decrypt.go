@@ -22,6 +22,7 @@ var nestedTarXZMembers = []string{"bin.tar.xz", "usr.tar.xz", "migadmin.tar.xz",
 func cmdDecrypt(ctx context.Context, args []string) error {
 	fs := newCommandFlagSet("decrypt", nil)
 	outDir := fs.String("o", "", "output directory (required)")
+	showKeys := fs.Bool("show-keys", false, "print recovered key material")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool decrypt -- full pipeline: raw .out -> unpacked rootfs, one command
 
@@ -45,7 +46,10 @@ USAGE
   fortitool decrypt -o OUTDIR <image.out>
 
 FLAGS
-  -o OUTDIR   output directory (required) -- created if missing
+  -o OUTDIR     output directory (required) -- must not already exist;
+                published only on success, private to the invoking identity
+                (mode 0700 on Unix; protected per-user DACL on Windows)
+  --show-keys   print recovered key material (redacted by default)
 
 EXAMPLE
   fortitool decrypt -o work/v7411 FWF_60E-v7.4.11-build2878-FORTINET.out
@@ -76,9 +80,11 @@ EXIT CODES
 		return usagef("usage: fortitool decrypt -o OUTDIR <image.out>")
 	}
 	inPath := fs.Arg(0)
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+	staged, err := newStagedOutputDir(*outDir)
+	if err != nil {
 		return err
 	}
+	defer staged.Cleanup()
 
 	fmt.Printf("[1/6] loading %s\n", terminalText(inPath))
 	raw, err := os.ReadFile(inPath)
@@ -97,7 +103,7 @@ EXIT CODES
 		return fmt.Errorf("no valid L1 key found")
 	}
 	if wasEncrypted {
-		fmt.Printf("      key: %s\n", terminalText(string(key)))
+		fmt.Printf("      %s\n", formatRecoveredKey(key, *showKeys))
 	} else {
 		fmt.Println("      already cleartext")
 	}
@@ -111,10 +117,10 @@ EXIT CODES
 
 	extract := func(name string) ([]byte, error) {
 		data, err := volume.ReadFile(name)
-		if err != nil {
+		if errors.Is(err, diskimage.ErrNotFound) {
 			return nil, nil // absent -- not every image carries every optional file
 		}
-		return data, nil
+		return data, err
 	}
 
 	flatkc, err := extract("flatkc")
@@ -128,67 +134,113 @@ EXIT CODES
 	if flatkc == nil || rootfsGz == nil {
 		return fmt.Errorf("flatkc or rootfs.gz not found in the located volume")
 	}
-	if err := os.WriteFile(filepath.Join(*outDir, "flatkc"), flatkc, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staged.temp, "flatkc"), flatkc, 0o644); err != nil {
 		return err
 	}
 
 	for _, extra := range []string{"datafs.tar.gz", "devicetree.dtb", "filechecksum", "hash_bin.sha256", "split_rootfs.tar.xz", ".db"} {
 		data, err := extract(extra)
-		if err != nil || data == nil {
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", extra, err)
+		}
+		if data == nil {
 			continue
 		}
-		if err := os.WriteFile(filepath.Join(*outDir, extra), data, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(staged.temp, extra), data, 0o644); err != nil {
 			return err
 		}
 	}
 
 	fmt.Println("[4/6] rootfs.gz decryption")
-	rootfsPlain, err := decryptRootfsAuto(ctx, flatkc, rootfsGz)
+	rootfsPlain, err := decryptRootfsAuto(ctx, flatkc, rootfsGz, *showKeys)
 	if err != nil {
 		return fmt.Errorf("rootfs decrypt: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(*outDir, "rootfs.gz.dec"), rootfsPlain, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staged.temp, "rootfs.gz.dec"), rootfsPlain, 0o644); err != nil {
 		return err
 	}
 
 	fmt.Println("[5/6] unpacking rootfs payload")
-	rootfsDir := filepath.Join(*outDir, "rootfs")
+	rootfsDir := filepath.Join(staged.temp, "rootfs")
 	if err := extractRootfsPayload(rootfsPlain, rootfsDir); err != nil {
 		return fmt.Errorf("rootfs unpack: %w", err)
 	}
 
 	fmt.Println("[6/6] unpacking nested tar+xz members")
+	if err := extractNestedMembers(rootfsDir); err != nil {
+		return err
+	}
+
+	if extracted, err := extractDatafs(staged.temp); err != nil {
+		return err
+	} else if extracted {
+		fmt.Println("      datafs.tar.gz -> datafs/")
+	}
+
+	initSize := int64(-1)
+	if st, err := os.Stat(filepath.Join(rootfsDir, "bin", "init")); err == nil {
+		initSize = st.Size()
+	}
+	if err := staged.Commit(); err != nil {
+		return err
+	}
+	if initSize >= 0 {
+		fmt.Printf("\n[+] DONE: %s (%d bytes)\n", terminalText(filepath.Join(*outDir, "rootfs", "bin", "init")), initSize)
+	} else {
+		fmt.Printf("\n[+] DONE: unpacked under %s\n", terminalText(*outDir))
+	}
+	return nil
+}
+
+func extractNestedMembers(rootfsDir string) error {
 	for _, member := range nestedTarXZMembers {
 		memberPath := filepath.Join(rootfsDir, member)
+		info, err := os.Lstat(memberPath)
+		if os.IsNotExist(err) {
+			continue // not every build ships every member
+		}
+		if err != nil {
+			return fmt.Errorf("checking nested member %s: %w", member, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("nested member %s is not a regular file", member)
+		}
 		data, err := os.ReadFile(memberPath)
 		if err != nil {
-			continue // not every build ships every member
+			return fmt.Errorf("reading nested member %s: %w", member, err)
 		}
 		// Each member's own tar entries are already rooted at "./<name>/...",
 		// e.g. bin.tar.xz contains "./bin/acd" -- extract into rootfsDir
 		// itself so it merges in place instead of double-nesting.
 		if err := archive.ExtractXZTar(data, rootfsDir); err != nil {
-			fmt.Printf("      [-] %s: %s\n", member, terminalText(err.Error()))
-			continue
+			return fmt.Errorf("nested member %s: %w", member, err)
 		}
 		fmt.Printf("      %s merged into rootfs/\n", member)
 	}
 
-	if datafsGz, err := os.ReadFile(filepath.Join(*outDir, "datafs.tar.gz")); err == nil {
-		if err := archive.ExtractGzipTar(datafsGz, filepath.Join(*outDir, "datafs")); err != nil {
-			fmt.Printf("      [-] datafs.tar.gz: %s\n", terminalText(err.Error()))
-		} else {
-			fmt.Println("      datafs.tar.gz -> datafs/")
-		}
-	}
-
-	initPath := filepath.Join(rootfsDir, "bin", "init")
-	if st, err := os.Stat(initPath); err == nil {
-		fmt.Printf("\n[+] DONE: %s (%d bytes)\n", terminalText(initPath), st.Size())
-	} else {
-		fmt.Printf("\n[+] DONE: unpacked under %s\n", terminalText(*outDir))
-	}
 	return nil
+}
+
+func extractDatafs(outputDir string) (bool, error) {
+	datafsPath := filepath.Join(outputDir, "datafs.tar.gz")
+	info, err := os.Lstat(datafsPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("checking datafs.tar.gz: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("datafs.tar.gz is not a regular file")
+	}
+	datafsGz, err := os.ReadFile(datafsPath)
+	if err != nil {
+		return false, fmt.Errorf("reading datafs.tar.gz: %w", err)
+	}
+	if err := archive.ExtractGzipTar(datafsGz, filepath.Join(outputDir, "datafs")); err != nil {
+		return false, fmt.Errorf("datafs.tar.gz: %w", err)
+	}
+	return true, nil
 }
 
 // openVolume locates a readable ext filesystem inside a decrypted firmware
@@ -260,6 +312,10 @@ func extractRootfsPayload(plain []byte, destDir string) error {
 		}
 		return vol.ExtractAll(destDir)
 	default:
-		return fmt.Errorf("decrypted rootfs is neither gzip nor xz (starts %x)", plain[:6])
+		prefix := plain
+		if len(prefix) > 6 {
+			prefix = prefix[:6]
+		}
+		return fmt.Errorf("decrypted rootfs is neither gzip nor xz (starts %x)", prefix)
 	}
 }

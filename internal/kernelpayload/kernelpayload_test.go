@@ -36,6 +36,65 @@ func TestExtractNoGzipMember(t *testing.T) {
 	}
 }
 
+func TestExtractRejectsCorruptKernelGzipTrailer(t *testing.T) {
+	kernel := bytes.Repeat([]byte("kernelbytes-"), 100_000)
+	member := gzipBytes(t, kernel)
+	member[len(member)-8] ^= 0xff
+	if _, _, err := Extract(append([]byte("flatkc-prefix"), member...)); err == nil {
+		t.Fatal("expected a corrupt kernel gzip trailer to fail")
+	}
+}
+
+func TestExtractRejectsTruncatedKernelGzip(t *testing.T) {
+	kernel := bytes.Repeat([]byte("kernelbytes-"), 100_000)
+	member := gzipBytes(t, kernel)
+	if _, _, err := Extract(append([]byte("flatkc-prefix"), member[:len(member)-4]...)); err == nil {
+		t.Fatal("expected a truncated kernel gzip member to fail")
+	}
+}
+
+func TestExtractDoesNotMergeConcatenatedMembers(t *testing.T) {
+	small := gzipBytes(t, bytes.Repeat([]byte("small"), 100))
+	kernel := bytes.Repeat([]byte("kernelbytes-"), 100_000)
+	large := gzipBytes(t, kernel)
+	prefix := []byte("flatkc-prefix")
+	flatkc := append(append(append([]byte{}, prefix...), small...), large...)
+
+	payload, off, err := Extract(flatkc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, kernel) {
+		t.Fatalf("payload includes the wrong gzip member: got %d bytes", len(payload))
+	}
+	if want := len(prefix) + len(small); off != want {
+		t.Fatalf("gzip offset = %d, want %d", off, want)
+	}
+}
+
+func TestExtractAllowsFortinetTailAfterCompleteMember(t *testing.T) {
+	kernel := bytes.Repeat([]byte("kernelbytes-"), 100_000)
+	member := gzipBytes(t, kernel)
+	flatkc := append(append([]byte("flatkc-prefix"), member...), []byte("non-gzip Fortinet tail")...)
+
+	payload, _, err := Extract(flatkc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload, kernel) {
+		t.Fatalf("payload = %d bytes, want %d", len(payload), len(kernel))
+	}
+}
+
+func TestExtractRejectsKernelExpansionPastLimit(t *testing.T) {
+	limit := int64(minKernelPayloadSize + 64)
+	kernel := bytes.Repeat([]byte("k"), int(limit)+1)
+	member := gzipBytes(t, kernel)
+	if _, _, err := extract(member, limit); err == nil {
+		t.Fatal("expected kernel gzip expansion past the limit to fail")
+	}
+}
+
 func gzipBytes(t *testing.T, data []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer

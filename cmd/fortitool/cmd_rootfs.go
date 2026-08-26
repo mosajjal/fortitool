@@ -1,19 +1,25 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/mosajjal/fortitool/internal/kernelpayload"
 	"github.com/mosajjal/fortitool/internal/rootfscrypto"
 )
 
+const maxStandaloneRootfsExpandedSize int64 = 4 << 30
+
 func cmdRootfs(ctx context.Context, args []string) error {
 	fs := newCommandFlagSet("rootfs", nil)
 	out := fs.String("o", "rootfs.gz.dec", "output file")
+	showKeys := fs.Bool("show-keys", false, "print recovered key material")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool rootfs -- decrypt rootfs.gz, any known FortiOS era, auto-detected
 
@@ -39,7 +45,8 @@ USAGE
   pipeline starting from the raw .out file.
 
 FLAGS
-  -o FILE   output file (default: rootfs.gz.dec)
+  -o FILE      output file (default: rootfs.gz.dec; must not exist)
+  --show-keys  print recovered key material (redacted by default)
 
 EXAMPLE
   fortitool rootfs -o rootfs.gz.dec fs/flatkc fs/rootfs.gz
@@ -48,6 +55,8 @@ OUTPUT
   Prints which crypto family/cipher matched and whether the embedded
   SHA-256 hash check passed, then writes the decrypted rootfs.gz (still
   gzip-compressed tar -- pipe it to 'fortitool unpack' to extract it).
+  The standalone decrypted file is private to the invoking identity: mode 0600
+  on Unix and a protected per-user DACL on Windows.
 
 EXIT CODES
   0  decrypted (or was already plain gzip -- check stdout for which)
@@ -76,11 +85,11 @@ EXIT CODES
 		return err
 	}
 
-	plain, err := decryptRootfsAuto(ctx, flatkc, rootfsGz)
+	plain, err := decryptRootfsAuto(ctx, flatkc, rootfsGz, *showKeys)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(*out, plain, 0o644); err != nil {
+	if err := writeNewFile(*out, plain, 0o600); err != nil {
 		return err
 	}
 	fmt.Printf("[+] wrote %s (%d bytes)\n", terminalText(*out), len(plain))
@@ -89,8 +98,11 @@ EXIT CODES
 
 // decryptRootfsAuto handles both encrypted (7.4.x+) and plain (<=7.4.0)
 // rootfs.gz: plain images are already valid gzip and need no crypto at all.
-func decryptRootfsAuto(ctx context.Context, flatkc, rootfsGz []byte) ([]byte, error) {
-	if len(rootfsGz) > 2 && rootfsGz[0] == 0x1f && rootfsGz[1] == 0x8b {
+func decryptRootfsAuto(ctx context.Context, flatkc, rootfsGz []byte, showKeys bool) ([]byte, error) {
+	if len(rootfsGz) >= 2 && rootfsGz[0] == 0x1f && rootfsGz[1] == 0x8b {
+		if err := validateGzipMember(rootfsGz, maxStandaloneRootfsExpandedSize); err != nil {
+			return nil, fmt.Errorf("validating plain rootfs gzip: %w", err)
+		}
 		fmt.Println("[+] rootfs.gz is already plain gzip (pre-7.4.1 image, no rootfs crypto)")
 		return rootfsGz, nil
 	}
@@ -107,6 +119,31 @@ func decryptRootfsAuto(ctx context.Context, flatkc, rootfsGz []byte) ([]byte, er
 	}
 	fmt.Printf("[+] seed family=%s cipher=%s hashOK=%v @ kernel offset 0x%x\n",
 		terminalText(res.Seed.Family), terminalText(res.Cipher), res.HashOK, res.Seed.SeedOffset)
-	fmt.Printf("    %s\n", terminalText(res.KeyDetail))
+	fmt.Printf("    %s\n", formatRootfsKeyDetail(res.KeyDetail, showKeys))
+	if len(res.Plaintext) >= 2 && res.Plaintext[0] == 0x1f && res.Plaintext[1] == 0x8b {
+		if err := validateGzipMember(res.Plaintext, maxStandaloneRootfsExpandedSize); err != nil {
+			return nil, fmt.Errorf("validating decrypted rootfs gzip: %w", err)
+		}
+	}
 	return res.Plaintext, nil
+}
+
+func validateGzipMember(data []byte, maxExpanded int64) error {
+	if maxExpanded < 0 {
+		return fmt.Errorf("invalid gzip expansion limit %d", maxExpanded)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer r.Close()
+	r.Multistream(false)
+	n, err := io.Copy(io.Discard, io.LimitReader(r, maxExpanded+1))
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	if n > maxExpanded {
+		return fmt.Errorf("gzip expands past %d bytes", maxExpanded)
+	}
+	return nil
 }
