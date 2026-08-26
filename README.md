@@ -63,6 +63,8 @@ For config secrets, prefer `--stdin` or `--file` so the ciphertext does
 not appear in process listings or shell history. The direct
 `fortitool config decrypt <base64-blob>` form remains available only for
 compatibility, and exactly one of the three input sources is accepted.
+Input is limited to 1 MiB; surrounding whitespace is trimmed, and the
+remaining value must be non-empty and contain no whitespace.
 
 With `pkg inspect --content`, verification succeeds only when the wrapper
 contains at least one signer and every `SignerInfo` validates against the
@@ -71,6 +73,11 @@ in the PKCS#7 wrapper; it does not validate their trust chains to a trusted
 root CA.
 
 ## Supported firmware
+
+Across 167 unique images tested, with versions spanning FortiOS 3.0 through
+8.0, L1/header recovery succeeded for every image and matched an independent
+decoder byte-for-byte. This covers that stage and tested set only; later
+decryption and extraction remain format-dependent, as detailed below.
 
 | Layer | Coverage | Status |
 |---|---|---|
