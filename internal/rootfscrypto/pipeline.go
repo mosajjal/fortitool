@@ -46,7 +46,7 @@ func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result
 		return nil, err
 	}
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no seed/RSA-key material found in kernel payload (%d bytes)", len(kernelPayload))
+		return decryptStaticChaCha20(ctx, kernelPayload, rootfsGz)
 	}
 
 	var matches []*Result
