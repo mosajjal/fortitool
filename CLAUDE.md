@@ -23,7 +23,8 @@ the "no OS packages at runtime" promise this whole project exists for.
 internal/l1            outer .out XOR cipher (known-plaintext attack)
 internal/kernelpayload  flatkc -> decompressed kernel bytes
 internal/rootfscrypto   seed/RSA-key scanner + all rootfs.gz body ciphers
-internal/diskimage      read-only ext2/ext3 (MBR-stripped partition -> files)
+internal/qcow2          read-only qcow2 (VM disk) reader
+internal/diskimage      read-only ext2/ext3/ext4 (MBR-stripped partition -> files)
 internal/archive        tar/gzip/xz unpacking (stdlib + pure-Go xz)
 internal/pkcs7          PKCS#7 SignedData parse + detached-signature verify
 internal/configsecret   config-backup ENC secret decrypt
