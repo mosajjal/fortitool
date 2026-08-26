@@ -45,6 +45,9 @@ USAGE
   argv input remains available for compatibility. Exactly one input source
   must be selected.
 
+  Input is limited to 1 MiB; surrounding whitespace is trimmed, and the
+  remaining value must be non-empty and contain no whitespace.
+
 FLAGS
   --stdin       read one base64 ciphertext from standard input
   --file FILE   read one base64 ciphertext from FILE

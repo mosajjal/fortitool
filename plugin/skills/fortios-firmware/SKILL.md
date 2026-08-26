@@ -24,7 +24,7 @@ or build from source (`git clone https://github.com/mosajjal/fortitool && cd for
 | `fortitool decrypt -o OUTDIR image.out` | Full pipeline: raw `.out` -> unpacked rootfs, one shot. Try this first for a firmware image. |
 | `fortitool l1 -o out.img image.out` | Outer XOR layer only |
 | `fortitool rootfs -o out.gz flatkc rootfs.gz` | rootfs.gz crypto layer only |
-| `fortitool unpack -o outdir archive` | Generic gzip+tar / xz+tar extraction |
+| `fortitool unpack -o outdir archive` | Generic tar / gzip+tar / xz+tar extraction |
 | `fortitool pkg scan datafs/` | Classify files in a directory, find PKCS#7 signatures |
 | `fortitool pkg inspect --content payload sig.x` | Verify every signer in a detached PKCS#7 signature (integrity only; no trust-chain validation) |
 | `fortitool config decrypt --stdin` | Decrypt a config-backup `ENC` secret without exposing it in argv |
@@ -41,17 +41,21 @@ parser doesn't permute argv).
 
 ## Notes
 
-- `decrypt` currently targets the FSoC3/ARM appliance MBR+ext3 partition
-  layout. If it fails partway through on an x86/VM image, fall back to
-  `l1` + `rootfs` as building blocks against the extracted partition.
+- `decrypt` discovers supported ext filesystems in raw MBR-partitioned,
+  qcow2, and fixed-offset disk layouts. Its output directory must not already
+  exist and is published only after the complete pipeline succeeds.
 - `config decrypt` auto-detects and handles both known key eras (legacy,
   through FortiOS 7.2.3, and >=7.4/build 2731) -- no flags needed. If it
   still reports an unrecognized format, the field's blob layout isn't one
   of the two known ones yet, not a version issue.
 - Prefer `config decrypt --stdin` or `--file` so ciphertext does not appear
   in process listings or shell history. Direct argv input is retained only
-  for compatibility; do not combine input sources.
+  for compatibility; select exactly one source. Input is limited to 1 MiB;
+  surrounding whitespace is trimmed, and the remaining value must be non-empty
+  and contain no whitespace.
 - Exit code 0 = succeeded (including "already cleartext" / recognized
   unsupported cases where relevant); 1 = failed; 2 = usage error.
 - Decrypted files and staged output trees are private to the invoking identity:
   mode 0600 or 0700 on Unix, and a protected per-user DACL on Windows.
+  Destinations must not already exist, and recovered keys are redacted unless
+  `--show-keys` is explicitly requested.
