@@ -15,9 +15,11 @@ type Partition struct {
 }
 
 const (
-	mbrSignature0 = 0x55
-	mbrSignature1 = 0xAA
-	maxPartitions = 4
+	mbrSignature0        = 0x55
+	mbrSignature1        = 0xAA
+	maxPartitions        = 4
+	sectorSize           = 512
+	filesystemScanStride = 0x400000
 )
 
 // ReadMBR parses the DOS partition table of a disk whose first sector
@@ -35,8 +37,8 @@ func ReadMBR(r io.ReaderAt) ([]Partition, error) {
 	var parts []Partition
 	for i := 0; i < maxPartitions; i++ {
 		e := sector[446+i*16 : 446+(i+1)*16]
-		start := int64(binary.LittleEndian.Uint32(e[8:12])) * 512
-		length := int64(binary.LittleEndian.Uint32(e[12:16])) * 512
+		start := sectorsToBytes(binary.LittleEndian.Uint32(e[8:12]))
+		length := sectorsToBytes(binary.LittleEndian.Uint32(e[12:16]))
 		if e[4] == 0 || length == 0 {
 			continue
 		}
@@ -53,8 +55,12 @@ func ReadMBR(r io.ReaderAt) ([]Partition, error) {
 // ProbeExt checks whether a valid ext superblock sits at the given byte
 // offset of r (i.e. the filesystem would start there).
 func ProbeExt(r io.ReaderAt, off int64) bool {
+	superMagic, ok := checkedAddInt64(off, superblockOffset+56)
+	if !ok {
+		return false
+	}
 	sb := make([]byte, 2)
-	if _, err := r.ReadAt(sb, off+superblockOffset+56); err != nil {
+	if _, err := r.ReadAt(sb, superMagic); err != nil {
 		return false
 	}
 	return binary.LittleEndian.Uint16(sb) == ext2Magic
@@ -68,33 +74,126 @@ func ProbeExt(r io.ReaderAt, off int64) bool {
 //     FortiManager images keep the volume at 0x400000 with no MBR).
 //  3. A coarse aligned scan as a last resort.
 //
-// Each candidate is fully validated by parsing its superblock and group
-// descriptors; failures are skipped silently.
+// Each candidate is validated by parsing its superblock and root inode
+// metadata; failures are skipped silently.
 func FindFilesystems(r io.ReaderAt, size int64) []*FS {
-	var candidates []int64
+	if size < 0 {
+		return nil
+	}
+	type candidate struct {
+		offset int64
+		length int64
+	}
+	var candidates []candidate
+	claimedPartitionOffsets := make(map[int64]struct{})
+	var partitions []Partition
 
-	if parts, err := ReadMBR(r); err == nil {
+	if parts, err := ReadMBR(io.NewSectionReader(r, 0, size)); err == nil {
 		for _, p := range parts {
-			candidates = append(candidates, p.StartByte)
+			if off, length, ok := partitionWindow(p, size); ok {
+				partitions = append(partitions, p)
+				claimedPartitionOffsets[off] = struct{}{}
+				candidates = append(candidates, candidate{offset: off, length: length})
+			}
 		}
 	}
-	candidates = append(candidates, 0, 512, 0x400000, 0x100000, 0x200000)
-	for off := int64(0x400000); off < size; off += 0x400000 {
-		candidates = append(candidates, off)
+	for _, off := range []int64{0, 512, 0x400000, 0x100000, 0x200000} {
+		if _, claimed := claimedPartitionOffsets[off]; !claimed {
+			if length, ok := fallbackWindow(off, size, partitions); ok {
+				candidates = append(candidates, candidate{offset: off, length: length})
+			}
+		}
+	}
+	for off := int64(filesystemScanStride); off < size; {
+		if _, claimed := claimedPartitionOffsets[off]; !claimed {
+			if length, ok := fallbackWindow(off, size, partitions); ok {
+				candidates = append(candidates, candidate{offset: off, length: length})
+			}
+		}
+		if size-off <= filesystemScanStride {
+			break
+		}
+		off += filesystemScanStride
 	}
 
 	seen := map[int64]bool{}
 	var out []*FS
-	for _, off := range candidates {
-		if off < 0 || off >= size || seen[off] || !ProbeExt(r, off) {
+	for _, candidate := range candidates {
+		if seen[candidate.offset] {
 			continue
 		}
-		seen[off] = true
-		fs, err := OpenAt(io.NewSectionReader(r, off, size-off), size-off)
+		seen[candidate.offset] = true
+		if !probeExtWindow(r, candidate.offset, candidate.length) {
+			continue
+		}
+		fs, err := OpenAt(io.NewSectionReader(r, candidate.offset, candidate.length), candidate.length)
 		if err != nil {
 			continue
 		}
 		out = append(out, fs)
 	}
 	return out
+}
+
+func sectorsToBytes(sectors uint32) int64 {
+	return int64(sectors) * sectorSize
+}
+
+func checkedAddInt64(a, b int64) (int64, bool) {
+	if a < 0 || b < 0 || a > int64(^uint64(0)>>1)-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func partitionWindow(part Partition, diskSize int64) (int64, int64, bool) {
+	end, ok := checkedAddInt64(part.StartByte, part.LengthBytes)
+	if !ok || part.LengthBytes == 0 || end > diskSize {
+		return 0, 0, false
+	}
+	return part.StartByte, part.LengthBytes, true
+}
+
+// fallbackWindow keeps a non-partition candidate inside the MBR interval or
+// unpartitioned gap that contains it. Invalid claimed ranges are not scanned.
+func fallbackWindow(off, diskSize int64, partitions []Partition) (int64, bool) {
+	if off < 0 || off >= diskSize {
+		return 0, false
+	}
+	end := diskSize
+	for _, part := range partitions {
+		partEnd, ok := checkedAddInt64(part.StartByte, part.LengthBytes)
+		if !ok || part.LengthBytes == 0 {
+			if off >= part.StartByte {
+				return 0, false
+			}
+			if part.StartByte > off && part.StartByte < end {
+				end = part.StartByte
+			}
+			continue
+		}
+		if part.StartByte > off && part.StartByte < end {
+			end = part.StartByte
+		}
+		if off >= part.StartByte && off < partEnd {
+			if partEnd > diskSize {
+				return 0, false
+			}
+			if partEnd < end {
+				end = partEnd
+			}
+		}
+	}
+	if end <= off {
+		return 0, false
+	}
+	return end - off, true
+}
+
+func probeExtWindow(r io.ReaderAt, off, length int64) bool {
+	required := int64(superblockOffset + 56 + 2)
+	if off < 0 || length < required {
+		return false
+	}
+	return ProbeExt(r, off)
 }

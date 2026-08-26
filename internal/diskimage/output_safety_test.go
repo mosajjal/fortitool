@@ -5,11 +5,12 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestValidateEntryName(t *testing.T) {
-	for _, name := range []string{"", ".", "..", "../escape", "dir/file", `dir\\file`, "nul\x00name"} {
+	for _, name := range []string{"", ".", "..", "../escape", "dir/file", `dir\\file`, "nul\x00name", strings.Repeat("x", 256)} {
 		if err := validateEntryName(name); err == nil {
 			t.Errorf("validateEntryName(%q) succeeded", name)
 		}
@@ -111,6 +112,34 @@ func TestExtractAllSkipsUnreadableFileData(t *testing.T) {
 	}
 }
 
+func TestExtractAllMaterialisesSparseFileLargerThanFilesystem(t *testing.T) {
+	img := fakeExt2(t)
+	logicalSize := uint32(len(img) + testBlockSize)
+	inodeOffset := fixtureInodeOffset(inoSmall)
+	binary.LittleEndian.PutUint32(img[inodeOffset+4:inodeOffset+8], logicalSize)
+	fs, err := Open(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "output")
+	if err := fs.ExtractAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "small.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != int(logicalSize) {
+		t.Fatalf("extracted sparse file size = %d, want %d", len(got), logicalSize)
+	}
+	if !bytes.Equal(got[:len(smallContent)], smallContent) {
+		t.Fatalf("extracted sparse file prefix = %q", got[:len(smallContent)])
+	}
+	if !bytes.Equal(got[len(smallContent):], make([]byte, int(logicalSize)-len(smallContent))) {
+		t.Fatal("extracted sparse range contains non-zero data")
+	}
+}
+
 func TestExtractAllSkipsUnreadableNonDirectoryInode(t *testing.T) {
 	img := fakeExt2(t)
 	inodeOffset := int64(testInodeTblBlock*testBlockSize + int(inoSmall-1)*128)
@@ -131,6 +160,41 @@ func TestExtractAllSkipsUnreadableNonDirectoryInode(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "subdir", "nested.txt")); err != nil {
 		t.Fatalf("later readable file was not extracted: %v", err)
+	}
+}
+
+func TestExtractAllRejectsUnreadableDirectoryInode(t *testing.T) {
+	img := fakeExt2(t)
+	inodeOffset := int64(testInodeTblBlock*testBlockSize + int(inoSub-1)*128)
+	fs, err := OpenAt(failingReaderAt{
+		reader:    bytes.NewReader(img),
+		failStart: inodeOffset,
+		failEnd:   inodeOffset + 128,
+	}, int64(len(img)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ExtractAll(filepath.Join(t.TempDir(), "output")); err == nil {
+		t.Fatal("expected an unreadable directory inode to remain fatal")
+	}
+}
+
+func TestExtractAllRejectsUnreadableLegacyEntryInode(t *testing.T) {
+	img := fakeExt2(t)
+	binary.LittleEndian.PutUint32(img[testBlockSize+96:testBlockSize+100], 0)
+	clearFixtureDirFileTypes(t, img, rootDirBlock)
+	clearFixtureDirFileTypes(t, img, subDirBlock)
+	inodeOffset := int64(testInodeTblBlock*testBlockSize + int(inoSmall-1)*128)
+	fs, err := OpenAt(failingReaderAt{
+		reader:    bytes.NewReader(img),
+		failStart: inodeOffset,
+		failEnd:   inodeOffset + 128,
+	}, int64(len(img)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.ExtractAll(filepath.Join(t.TempDir(), "output")); err == nil {
+		t.Fatal("expected an unreadable legacy entry without a file type to remain fatal")
 	}
 }
 
@@ -158,6 +222,34 @@ func TestExtractAllRebasesAbsoluteSymlink(t *testing.T) {
 	}
 	if target != "small.txt" {
 		t.Fatalf("rebased target = %q", target)
+	}
+}
+
+func TestExtractAllRebasesRepeatedSymlinkPerPath(t *testing.T) {
+	img := fakeExt2(t)
+	addFastSymlink(t, img, "root-link", "/small.txt")
+	addFixtureDirectoryEntry(t, img, subDirBlock, 7, 7, "deep-link")
+	fs, err := Open(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "output")
+	if err := fs.ExtractAll(dest); err != nil {
+		t.Fatal(err)
+	}
+	rootTarget, err := os.Readlink(filepath.Join(dest, "root-link"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootTarget != "small.txt" {
+		t.Fatalf("root symlink target = %q, want %q", rootTarget, "small.txt")
+	}
+	deepTarget, err := os.Readlink(filepath.Join(dest, "subdir", "deep-link"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deepTarget != "../small.txt" {
+		t.Fatalf("nested symlink target = %q, want %q", deepTarget, "../small.txt")
 	}
 }
 

@@ -20,7 +20,7 @@ import (
 //	2       block group descriptor table
 //	3       inode table (4 inodes * 128 bytes, one block)
 //	4       root dir data
-//	5       extent tree index node (depth 1)
+//	5       inode bitmap
 //	6       extent tree leaf node (depth 0)
 //	7-8     sparse.data first extent (2 blocks)
 //	9-10    hole (logical blocks 2-3)
@@ -41,7 +41,7 @@ var sparseContent = func() []byte {
 	return b
 }()
 
-func buildExtentFS(t *testing.T) []byte {
+func buildExtentFS(t testing.TB) []byte {
 	t.Helper()
 	totalBlocks := 12
 	img := make([]byte, totalBlocks*extBlockSize)
@@ -59,9 +59,12 @@ func buildExtentFS(t *testing.T) []byte {
 	le32(sb[76:80], 1)                   // s_rev_level = dynamic
 	le16(sb[56:58], 0xEF53)
 	le16(sb[88:90], 128) // s_inode_size
+	le32(sb[96:100], extFeatureIncompatFiletype|extFeatureIncompatExtents)
 
 	gdt := block(2)
+	le32(gdt[4:8], 5)  // bg_inode_bitmap
 	le32(gdt[8:12], 3) // bg_inode_table
+	block(5)[0] = 0x07
 
 	writeInode := func(num uint32, mode uint16, size uint32, fill func(raw []byte)) {
 		off := (3 * extBlockSize) + int(num-1)*128
@@ -94,6 +97,7 @@ func buildExtentFS(t *testing.T) []byte {
 		le32(raw[12:16], 0)
 		le32(raw[16:20], 6)
 	})
+	binary.LittleEndian.PutUint32(img[3*extBlockSize+2*128+32:3*extBlockSize+2*128+36], inodeFlagExtents)
 
 	writeDirBlock := func(blockNum int, entries []dirEnt) {
 		buf := block(blockNum)
@@ -119,11 +123,6 @@ func buildExtentFS(t *testing.T) []byte {
 		{2, 2, ".."},
 		{3, 1, "sparse.data"},
 	})
-
-	// extent index node (block 5): kept structurally valid but unused --
-	// the root points straight at the leaf for simplicity of the fixture;
-	// real trees may have arbitrary intermediate nodes.
-	le16(block(5)[0:2], 0xF30A)
 
 	// extent leaf node (block 6): two extents with a hole between them
 	leaf := block(6)

@@ -10,7 +10,7 @@ import (
 
 // fakeExt2 builds a minimal, single-block-group ext2 image by hand,
 // exercising the same on-disk structures the real firmware partition
-// uses (classic 32-byte group descriptor, 128-byte GOOD_OLD_REV inodes,
+// uses (classic 32-byte group descriptor, 128-byte dynamic-revision inodes,
 // direct + single-indirect block mapping) without needing any real,
 // copyrighted firmware data.
 //
@@ -28,16 +28,17 @@ import (
 //	23      big.txt single-indirect pointer block -> {24, 25}
 //	24-25   big.txt indirect data blocks
 const (
-	testBlockSize     = 1024
-	testInodesPerGrp  = 32
-	testBlocksPerGrp  = 30
-	testInodeTblBlock = 3
-	rootDirBlock      = 7
-	subDirBlock       = 8
-	smallFileBlock    = 9
-	nestedFileBlock   = 10
-	bigFileFirstBlock = 11
-	bigFileIndirBlock = 23
+	testBlockSize        = 1024
+	testInodesPerGrp     = 32
+	testBlocksPerGrp     = 30
+	testInodeTblBlock    = 3
+	testInodeBitmapBlock = 26
+	rootDirBlock         = 7
+	subDirBlock          = 8
+	smallFileBlock       = 9
+	nestedFileBlock      = 10
+	bigFileFirstBlock    = 11
+	bigFileIndirBlock    = 23
 )
 
 const (
@@ -53,9 +54,9 @@ var (
 	nestedContent = []byte("nested file content")
 )
 
-func fakeExt2(t *testing.T) []byte {
+func fakeExt2(t testing.TB) []byte {
 	t.Helper()
-	totalBlocks := 26
+	totalBlocks := 27
 	img := make([]byte, totalBlocks*testBlockSize)
 
 	block := func(n int) []byte { return img[n*testBlockSize : (n+1)*testBlockSize] }
@@ -70,14 +71,17 @@ func fakeExt2(t *testing.T) []byte {
 	le32(sb[24:28], 0)                 // s_log_block_size -> 1024<<0
 	le32(sb[32:36], testBlocksPerGrp)  // s_blocks_per_group
 	le32(sb[40:44], testInodesPerGrp)  // s_inodes_per_group
-	le32(sb[76:80], 0)                 // s_rev_level = GOOD_OLD_REV -> 128-byte inodes
+	le32(sb[76:80], 1)                 // s_rev_level = DYNAMIC_REV
 	le16(sb[56:58], 0xEF53)            // s_magic
+	le16(sb[88:90], defaultInodeSize)  // s_inode_size
+	le32(sb[96:100], extFeatureIncompatFiletype)
 
 	// block group descriptor table (block 2)
 	gdt := block(2)
-	le32(gdt[0:4], 0)                  // bg_block_bitmap (unused by our reader)
-	le32(gdt[4:8], 0)                  // bg_inode_bitmap (unused by our reader)
+	le32(gdt[0:4], 0) // bg_block_bitmap (unused by our reader)
+	le32(gdt[4:8], testInodeBitmapBlock)
 	le32(gdt[8:12], testInodeTblBlock) // bg_inode_table
+	block(testInodeBitmapBlock)[0] = 0x7f
 
 	writeInode := func(num uint32, mode uint16, size uint32, blocks []uint32) {
 		off := (testInodeTblBlock * testBlockSize) + int(num-1)*128
@@ -308,9 +312,9 @@ func TestReadFilePropagatesBlockReadFailures(t *testing.T) {
 
 func TestReadInodeDataPropagatesDoubleIndirectReadFailures(t *testing.T) {
 	const (
-		doubleTableBlock = 26
-		childTableBlock  = 27
-		doubleDataBlock  = 28
+		doubleTableBlock = 27
+		childTableBlock  = 28
+		doubleDataBlock  = 29
 		totalBlocks      = 300
 	)
 	for _, block := range []int{doubleTableBlock, childTableBlock, doubleDataBlock} {
