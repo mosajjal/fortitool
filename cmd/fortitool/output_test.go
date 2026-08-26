@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -40,6 +42,137 @@ func syntheticClearL1Image() []byte {
 	copy(plain[12:16], []byte{0xff, 0x00, 0xaa, 0x55})
 	copy(plain[16:46], []byte("SYNTH-v0.0.0-FW-build0000-test"))
 	return plain
+}
+
+func gzipBytes(t *testing.T, plain []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+func syntheticNewcRootfs(t *testing.T, trailer bool) []byte {
+	return syntheticNewcRootfsWithTail(t, trailer, nil)
+}
+
+func syntheticNewcRootfsWithTail(t *testing.T, trailer bool, tail []byte) []byte {
+	t.Helper()
+	var archive bytes.Buffer
+	writeEntry := func(name string, mode uint32, data []byte) {
+		nameBytes := append([]byte(name), 0)
+		header := fmt.Sprintf(
+			"070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
+			archive.Len()+1, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(nameBytes), 0,
+		)
+		if len(header) != 110 {
+			t.Fatalf("newc header length = %d", len(header))
+		}
+		archive.WriteString(header)
+		archive.Write(nameBytes)
+		for archive.Len()%4 != 0 {
+			archive.WriteByte(0)
+		}
+		archive.Write(data)
+		for archive.Len()%4 != 0 {
+			archive.WriteByte(0)
+		}
+	}
+	writeEntry("bin/init", 0o100755, []byte("synthetic init"))
+	if trailer {
+		writeEntry("TRAILER!!!", 0, nil)
+	}
+	archive.Write(tail)
+	return gzipBytes(t, archive.Bytes())
+}
+
+func syntheticDecryptImage(t *testing.T, rootfs []byte) []byte {
+	t.Helper()
+	const (
+		blockSize       = 1024
+		totalBlocks     = 10
+		inodesPerGroup  = 16
+		inodeTableBlock = 3
+		inodeBitmap     = 5
+		rootDirBlock    = 6
+		flatkcBlock     = 7
+		rootfsBlock     = 8
+	)
+	if len(rootfs) > blockSize {
+		t.Fatalf("synthetic rootfs is %d bytes", len(rootfs))
+	}
+	image := make([]byte, totalBlocks*blockSize)
+	block := func(number int) []byte {
+		return image[number*blockSize : (number+1)*blockSize]
+	}
+	le16 := binary.LittleEndian.PutUint16
+	le32 := binary.LittleEndian.PutUint32
+
+	copy(image[12:16], []byte{0xff, 0x00, 0xaa, 0x55})
+	copy(image[16:46], []byte("SYNTH-v0.0.0-FW-build0000-test"))
+
+	superblock := block(1)
+	le32(superblock[0:4], inodesPerGroup)
+	le32(superblock[4:8], totalBlocks)
+	le32(superblock[20:24], 1)
+	le32(superblock[24:28], 0)
+	le32(superblock[32:36], totalBlocks-1)
+	le32(superblock[40:44], inodesPerGroup)
+	le16(superblock[56:58], 0xef53)
+	le32(superblock[76:80], 1)
+	le16(superblock[88:90], 128)
+	le32(superblock[96:100], 2)
+
+	descriptor := block(2)
+	le32(descriptor[4:8], inodeBitmap)
+	le32(descriptor[8:12], inodeTableBlock)
+	block(inodeBitmap)[0] = 0x0f
+
+	writeInode := func(number uint32, mode uint16, size uint32, dataBlock uint32) {
+		offset := inodeTableBlock*blockSize + int(number-1)*128
+		inode := image[offset : offset+128]
+		le16(inode[0:2], mode)
+		le32(inode[4:8], size)
+		le32(inode[40:44], dataBlock)
+	}
+	flatkc := []byte("synthetic flatkc")
+	writeInode(2, 0o040755, blockSize, rootDirBlock)
+	writeInode(3, 0o100644, uint32(len(flatkc)), flatkcBlock)
+	writeInode(4, 0o100644, uint32(len(rootfs)), rootfsBlock)
+
+	type directoryEntry struct {
+		inode    uint32
+		fileType byte
+		name     string
+	}
+	entries := []directoryEntry{
+		{inode: 2, fileType: 2, name: "."},
+		{inode: 2, fileType: 2, name: ".."},
+		{inode: 3, fileType: 1, name: "flatkc"},
+		{inode: 4, fileType: 1, name: "rootfs.gz"},
+	}
+	directory := block(rootDirBlock)
+	offset := 0
+	for index, entry := range entries {
+		recordLength := (8 + len(entry.name) + 3) &^ 3
+		if index == len(entries)-1 {
+			recordLength = len(directory) - offset
+		}
+		le32(directory[offset:offset+4], entry.inode)
+		le16(directory[offset+4:offset+6], uint16(recordLength))
+		directory[offset+6] = byte(len(entry.name))
+		directory[offset+7] = entry.fileType
+		copy(directory[offset+8:offset+8+len(entry.name)], entry.name)
+		offset += recordLength
+	}
+	copy(block(flatkcBlock), flatkc)
+	copy(block(rootfsBlock), rootfs)
+	return gzipBytes(t, image)
 }
 
 func TestCmdUnpackPublishesCompleteTree(t *testing.T) {
@@ -551,6 +684,173 @@ func TestExtractDatafsDistinguishesOptionalAbsence(t *testing.T) {
 func TestExtractRootfsPayloadRejectsShortUnknownInput(t *testing.T) {
 	if err := extractRootfsPayload([]byte{0x01}, filepath.Join(t.TempDir(), "rootfs")); err == nil {
 		t.Fatal("expected short unknown rootfs payload to fail")
+	}
+}
+
+func TestCmdDecryptNewcPublishesPrivateOutput(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "synthetic.out")
+	output := filepath.Join(dir, "output")
+	firmware := syntheticDecryptImage(t, syntheticNewcRootfs(t, true))
+	if err := os.WriteFile(input, firmware, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := captureStdout(t, func() error {
+		return cmdDecrypt(context.Background(), []string{"-o", output, input})
+	})
+	if err != nil {
+		t.Fatalf("cmdDecrypt: %v", err)
+	}
+	if !strings.Contains(stdout, "DONE") {
+		t.Fatalf("successful decrypt did not print completion: %q", stdout)
+	}
+	if got, err := os.ReadFile(filepath.Join(output, "rootfs", "bin", "init")); err != nil || string(got) != "synthetic init" {
+		t.Fatalf("published init = %q, %v", got, err)
+	}
+	assertPrivateDirectory(t, output)
+}
+
+func TestCmdDecryptMalformedNewcDoesNotPublishOrLeaveResidue(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "synthetic.out")
+	output := filepath.Join(dir, "output")
+	firmware := syntheticDecryptImage(t, syntheticNewcRootfs(t, false))
+	if err := os.WriteFile(input, firmware, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := captureStdout(t, func() error {
+		return cmdDecrypt(context.Background(), []string{"-o", output, input})
+	})
+	if err == nil {
+		t.Fatal("expected malformed newc to fail")
+	}
+	if strings.Contains(stdout, "DONE") {
+		t.Fatalf("failed decrypt printed completion: %q", stdout)
+	}
+	if _, err := os.Lstat(output); !os.IsNotExist(err) {
+		t.Fatalf("failed newc was published: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".output.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("failed newc left staging residue: %v", matches)
+	}
+}
+
+func TestCmdDecryptRejectsNewcDataAfterTrailer(t *testing.T) {
+	secondNewc := func() []byte {
+		rootfs := syntheticNewcRootfs(t, true)
+		zr, err := gzip.NewReader(bytes.NewReader(rootfs))
+		if err != nil {
+			t.Fatal(err)
+		}
+		plain, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := zr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return plain
+	}()
+	trailingCRC := append([]byte(nil), secondNewc...)
+	copy(trailingCRC[:6], "070702")
+
+	for name, tail := range map[string][]byte{
+		"second-newc":  secondNewc,
+		"trailing-crc": trailingCRC,
+		"nonzero":      {0, 0, 1, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			input := filepath.Join(dir, "synthetic.out")
+			output := filepath.Join(dir, "output")
+			firmware := syntheticDecryptImage(t, syntheticNewcRootfsWithTail(t, true, tail))
+			if err := os.WriteFile(input, firmware, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := captureStdout(t, func() error {
+				return cmdDecrypt(context.Background(), []string{"-o", output, input})
+			})
+			if err == nil {
+				t.Fatal("expected trailing newc data to fail")
+			}
+			if strings.Contains(stdout, "DONE") {
+				t.Fatalf("failed decrypt printed completion: %q", stdout)
+			}
+			if _, err := os.Lstat(output); !os.IsNotExist(err) {
+				t.Fatalf("failed newc was published: %v", err)
+			}
+			matches, err := filepath.Glob(filepath.Join(dir, ".output.tmp-*"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(matches) != 0 {
+				t.Fatalf("failed newc left staging residue: %v", matches)
+			}
+		})
+	}
+}
+
+func TestCmdDecryptNewcAllowsZeroPadding(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "synthetic.out")
+	output := filepath.Join(dir, "output")
+	rootfs := syntheticNewcRootfsWithTail(t, true, make([]byte, 128))
+	if err := os.WriteFile(input, syntheticDecryptImage(t, rootfs), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDecrypt(context.Background(), []string{"-o", output, input}); err != nil {
+		t.Fatalf("cmdDecrypt: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(output, "rootfs", "bin", "init")); err != nil || string(got) != "synthetic init" {
+		t.Fatalf("published init = %q, %v", got, err)
+	}
+}
+
+func TestCmdDecryptTrailingNewcDataPreservesExistingDestination(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "synthetic.out")
+	output := filepath.Join(dir, "output")
+	if err := os.WriteFile(input, syntheticDecryptImage(t, syntheticNewcRootfsWithTail(t, true, []byte("070701"))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(output, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(output, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDecrypt(context.Background(), []string{"-o", output, input}); err == nil {
+		t.Fatal("expected existing destination to be rejected")
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "original" {
+		t.Fatalf("existing destination changed: %q, %v", got, err)
+	}
+}
+
+func TestCmdDecryptNewcPreservesExistingDestination(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "synthetic.out")
+	output := filepath.Join(dir, "output")
+	if err := os.WriteFile(input, syntheticDecryptImage(t, syntheticNewcRootfs(t, true)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(output, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(output, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDecrypt(context.Background(), []string{"-o", output, input}); err == nil {
+		t.Fatal("expected existing destination to be rejected")
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "original" {
+		t.Fatalf("existing destination changed: %q, %v", got, err)
 	}
 }
 

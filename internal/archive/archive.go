@@ -9,6 +9,7 @@ package archive
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"fmt"
@@ -42,6 +43,44 @@ func ExtractGzipTar(data []byte, destDir string) error {
 	// reader so its checksum and size trailer are still validated rather than
 	// accepting a truncated member after publishing a seemingly complete tar.
 	if _, err := io.Copy(io.Discard, gz); err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	if compressed.Len() > 0 {
+		tail := data[len(data)-compressed.Len():]
+		if next, err := gzip.NewReader(bytes.NewReader(tail)); err == nil {
+			_ = next.Close()
+			return fmt.Errorf("gzip: multiple members are unsupported")
+		}
+	}
+	return nil
+}
+
+// ExtractGzipRootfs extracts gzip-wrapped tar and newc CPIO rootfs
+// containers without relying on filenames, models, or versions.
+func ExtractGzipRootfs(data []byte, destDir string) error {
+	compressed := bytes.NewReader(data)
+	gz, err := gzip.NewReader(compressed)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer gz.Close()
+	gz.Multistream(false)
+
+	br := bufio.NewReader(gz)
+	magic, err := br.Peek(len(newcMagic))
+	if err != nil {
+		return fmt.Errorf("gzip payload: %w", err)
+	}
+	switch {
+	case bytes.Equal(magic, []byte(newcMagic)), bytes.Equal(magic, []byte(newcCRCMagic)):
+		err = ExtractNewc(br, destDir)
+	default:
+		err = Untar(br, destDir)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(io.Discard, br); err != nil {
 		return fmt.Errorf("gzip: %w", err)
 	}
 	if compressed.Len() > 0 {
@@ -101,20 +140,7 @@ func newXZReader(data []byte) (*xz.Reader, error) {
 // directories, and symlinks (FortiOS rootfs trees use symlinks heavily,
 // e.g. /etc -> data/etc).
 func Untar(r io.Reader, destDir string) error {
-	info, err := os.Lstat(destDir)
-	if os.IsNotExist(err) {
-		if err := os.MkdirAll(destDir, 0o755); err != nil {
-			return err
-		}
-		info, err = os.Lstat(destDir)
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("archive extraction destination is not a real directory: %q", destDir)
-	}
-	root, err := os.OpenRoot(destDir)
+	root, err := openArchiveRoot(destDir)
 	if err != nil {
 		return err
 	}
@@ -132,7 +158,7 @@ func Untar(r io.Reader, destDir string) error {
 		if hdr.Typeflag == tar.TypeXGlobalHeader {
 			continue
 		}
-		target, err := safeArchivePath(hdr.Name)
+		target, err := safeArchivePath("tar", hdr.Name)
 		if err != nil {
 			return err
 		}
@@ -172,7 +198,7 @@ func Untar(r io.Reader, destDir string) error {
 			} else if !os.IsNotExist(err) {
 				return err
 			}
-			linkTarget, err := safeSymlinkTarget(target, hdr.Linkname)
+			linkTarget, err := safeSymlinkTarget("tar", target, hdr.Linkname)
 			if err != nil {
 				return err
 			}
@@ -180,7 +206,7 @@ func Untar(r io.Reader, destDir string) error {
 				return err
 			}
 		case tar.TypeLink:
-			linkTarget, err := safeArchivePath(hdr.Linkname)
+			linkTarget, err := safeArchivePath("tar", hdr.Linkname)
 			if err != nil {
 				return err
 			}
@@ -213,16 +239,37 @@ func Untar(r io.Reader, destDir string) error {
 	}
 }
 
-func safeArchivePath(name string) (string, error) {
+func openArchiveRoot(destDir string) (*os.Root, error) {
+	info, err := os.Lstat(destDir)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(destDir, 0o755); err != nil {
+			return nil, err
+		}
+		info, err = os.Lstat(destDir)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, fmt.Errorf("archive extraction destination is not a real directory: %q", destDir)
+	}
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return nil, err
+	}
+	return root, nil
+}
+
+func safeArchivePath(format, name string) (string, error) {
 	if strings.ContainsRune(name, '\x00') {
-		return "", fmt.Errorf("tar entry contains a NUL byte: %q", name)
+		return "", fmt.Errorf("%s entry contains a NUL byte: %q", format, name)
 	}
 	// Tar paths use slash separators. Treat backslashes as separators too so
 	// an archive has the same safety result on Unix and Windows.
 	slashName := strings.ReplaceAll(name, `\`, "/")
 	for part := range strings.SplitSeq(slashName, "/") {
 		if part == ".." {
-			return "", fmt.Errorf("tar entry contains a path traversal component: %q", name)
+			return "", fmt.Errorf("%s entry contains a path traversal component: %q", format, name)
 		}
 	}
 	cleaned := strings.TrimPrefix(path.Clean("/"+slashName), "/")
@@ -230,7 +277,7 @@ func safeArchivePath(name string) (string, error) {
 		return ".", nil
 	}
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("tar entry escapes destination: %q", name)
+		return "", fmt.Errorf("%s entry escapes destination: %q", format, name)
 	}
 	return filepath.FromSlash(cleaned), nil
 }
@@ -280,9 +327,9 @@ func walkArchiveDir(root *os.Root, name string, create bool) error {
 	return nil
 }
 
-func safeSymlinkTarget(linkName, linkTarget string) (string, error) {
+func safeSymlinkTarget(format, linkName, linkTarget string) (string, error) {
 	if linkTarget == "" || strings.ContainsRune(linkTarget, '\x00') {
-		return "", fmt.Errorf("tar symlink %q has an invalid target", linkName)
+		return "", fmt.Errorf("%s symlink %q has an invalid target", format, linkName)
 	}
 	target := strings.ReplaceAll(linkTarget, `\`, "/")
 	if path.IsAbs(target) {
@@ -291,7 +338,7 @@ func safeSymlinkTarget(linkName, linkTarget string) (string, error) {
 		target = path.Clean(path.Join(path.Dir(filepath.ToSlash(linkName)), target))
 	}
 	if target == ".." || strings.HasPrefix(target, "../") {
-		return "", fmt.Errorf("tar symlink %q escapes destination: %q", linkName, linkTarget)
+		return "", fmt.Errorf("%s symlink %q escapes destination: %q", format, linkName, linkTarget)
 	}
 	relative, err := filepath.Rel(filepath.Dir(linkName), filepath.FromSlash(target))
 	if err != nil {
