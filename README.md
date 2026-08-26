@@ -201,8 +201,8 @@ anything you don't own or have explicit authorization to test.
 
 Issues and PRs welcome, especially real-firmware validation of the
 not-yet-verified paths in the table above (7.6.x, 8.0, x86_64 builds,
-qcow2 VM images). Run `go build ./... && go vet ./... && go test ./...`
-before submitting.
+qcow2 VM images). See [CONTRIBUTING.md](CONTRIBUTING.md) for the required
+checks and fixture policy.
 
 ## License
 
