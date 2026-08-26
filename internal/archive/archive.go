@@ -57,9 +57,9 @@ func ExtractGzipTar(data []byte, destDir string) error {
 // ExtractXZTar decompresses xz-compressed tar data (bin.tar.xz, usr.tar.xz,
 // migadmin.tar.xz, node-scripts.tar.xz) and writes it under destDir.
 func ExtractXZTar(data []byte, destDir string) error {
-	xr, err := xz.NewReader(newByteReader(data))
+	xr, err := newXZReader(data)
 	if err != nil {
-		return fmt.Errorf("xz: %w", err)
+		return err
 	}
 	if err := Untar(xr, destDir); err != nil {
 		return err
@@ -74,15 +74,27 @@ func ExtractXZTar(data []byte, destDir string) error {
 
 // XZDecompress fully decompresses a raw xz stream (not a tar).
 func XZDecompress(data []byte) ([]byte, error) {
-	xr, err := xz.NewReader(newByteReader(data))
+	xr, err := newXZReader(data)
 	if err != nil {
-		return nil, fmt.Errorf("xz: %w", err)
+		return nil, err
 	}
 	plain, err := io.ReadAll(xr)
 	if err != nil {
 		return nil, fmt.Errorf("xz: %w", err)
 	}
 	return plain, nil
+}
+
+func newXZReader(data []byte) (*xz.Reader, error) {
+	input, err := fortinetXZReader(data)
+	if err != nil {
+		return nil, err
+	}
+	xr, err := xz.NewReader(input)
+	if err != nil {
+		return nil, fmt.Errorf("xz: %w", err)
+	}
+	return xr, nil
 }
 
 // Untar extracts a tar stream to destDir, handling regular files,
