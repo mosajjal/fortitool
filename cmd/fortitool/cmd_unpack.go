@@ -16,13 +16,13 @@ func cmdUnpack(_ context.Context, args []string) error {
 	fs := newCommandFlagSet("unpack", nil)
 	out := fs.String("o", "", "output directory (required)")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `fortitool unpack -- extract a gzip+tar or xz+tar archive
+		fmt.Fprint(os.Stderr, `fortitool unpack -- extract a tar, gzip+tar, or xz+tar archive
 
 Format is auto-detected from the filename extension, falling back to
 sniffing the gzip magic bytes, falling back to assuming plain tar. This
 is a generic utility for the tar/xz archives found inside a decrypted
 FortiOS rootfs (bin.tar.xz, usr.tar.xz, migadmin.tar.xz, ...) and for
-datafs.tar.gz, but works on any gzip+tar / xz+tar file. Symlinks are
+datafs.tar.gz, but works on any tar / gzip+tar / xz+tar file. Symlinks are
 confined to the extraction tree (absolute archive targets are safely
 rebased within it); tar entries containing ".." path components are
 rejected rather than extracted.
