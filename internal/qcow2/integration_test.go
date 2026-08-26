@@ -28,9 +28,13 @@ func TestDiskimageOverQCow2(t *testing.T) {
 	le32(sb[24:28], 0)
 	le32(sb[32:36], 16)
 	le32(sb[40:44], 8)
-	le32(sb[76:80], 0)
+	le32(sb[76:80], 1)
 	le16(sb[56:58], 0xEF53)
-	le32(block(2)[8:12], 3) // bg_inode_table
+	le16(sb[88:90], 128)
+	le32(sb[96:100], 0x0002) // EXT2_FEATURE_INCOMPAT_FILETYPE
+	le32(block(2)[4:8], 7)   // bg_inode_bitmap
+	le32(block(2)[8:12], 3)  // bg_inode_table
+	block(7)[0] = 0x0f
 
 	writeInode := func(num uint32, mode uint16, size uint32, dataBlock uint32) {
 		raw := block(3)[(num-1)*128 : num*128]
