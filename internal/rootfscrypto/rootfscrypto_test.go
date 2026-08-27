@@ -447,6 +447,54 @@ func TestDecryptRootfsRejectsOverlappingNewAESCTRFailures(t *testing.T) {
 	}
 }
 
+func TestDecryptRootfsFallsBackToStreamCipherAfterStrictAESRejection(t *testing.T) {
+	key := genTestRSAKey(t)
+	kernel := make([]byte, 2048)
+	seed := make([]byte, seedLen)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	copy(kernel[256:256+seedLen], seed)
+	copy(kernel[256+seedLen:], xorDecrypt32(seed, key.der))
+
+	plaintext := buildGzipTar(t)
+	streamKey := []byte("0123456789abcdef0123456789abcdef")
+	body := modifiedRC4(streamKey, plaintext, false)
+	digest := sha256.Sum256(body)
+	payload := make([]byte, 80)
+	copy(payload[:32], digest[:])
+	copy(payload[32:48], []byte{0xd1, 0x03, 0x01})
+	copy(payload[48:], streamKey)
+
+	strictPlain := aesCustomCTR(payload[32:64], payload[64:72], getLE64(payload[72:80]), counterStep(payload[64:80]), body)
+	if !plausibleBody(strictPlain) || validCompleteGzipTar(strictPlain) {
+		t.Fatal("fixture does not produce a plausible but invalid strict AES body")
+	}
+	if result, handled := tryAESCTRKeyBeforeCounter(payload, body, digest[:]); result != nil || !handled {
+		t.Fatalf("strict AES result=%v handled=%v, want nil/true", result, handled)
+	}
+	if result := tryAESCTR(payload, body, digest[:]); result != nil {
+		t.Fatalf("strict AES rejection fell through to legacy AES: %+v", result)
+	}
+	if result := tryChaCha20Body(&SeedMaterial{Seed: seed}, body, digest[:]); result != nil {
+		t.Fatalf("fixture unexpectedly matched ChaCha20: %+v", result)
+	}
+
+	result, err := DecryptRootfs(context.Background(), kernel, buildSignedRootfs(t, key, body, payload))
+	if err != nil {
+		t.Fatalf("DecryptRootfs: %v", err)
+	}
+	if result.Cipher != "modified-rc4" {
+		t.Fatalf("cipher = %q, want modified-rc4", result.Cipher)
+	}
+	if !result.HashOK {
+		t.Fatal("HashOK = false, want true")
+	}
+	if !bytes.Equal(result.Plaintext, plaintext) {
+		t.Fatal("plaintext mismatch")
+	}
+}
+
 func TestDecryptRootfsRejectsIncompleteTarTermination(t *testing.T) {
 	complete := buildTar(t)
 	if len(complete) < 1024 || !bytes.Equal(complete[len(complete)-1024:], make([]byte, 1024)) {
@@ -952,8 +1000,8 @@ func TestTryAESCTRReportsMismatchedBodyHash(t *testing.T) {
 	if _, handled := tryAESCTRKeyBeforeCounter(payload, body, bodyHash); handled {
 		t.Fatal("legacy fixture is structurally ambiguous with a strict layout")
 	}
-	result, handled := tryAESCTR(payload, body, bodyHash)
-	if result == nil || !handled {
+	result := tryAESCTR(payload, body, bodyHash)
+	if result == nil {
 		t.Fatal("expected a plausible AES plaintext despite the mismatched body hash")
 	}
 	if result.HashOK {
