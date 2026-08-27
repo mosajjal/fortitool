@@ -293,14 +293,14 @@ func openVolume(img []byte) (*diskimage.FS, string, error) {
 // extractRootfsPayload unpacks a decrypted rootfs body. Two container
 // shapes exist across the product line:
 //
-//   - gzip-compressed GNU tar (everything through 7.6.x): extracted as a
-//     plain tar;
+//   - gzip-compressed GNU tar or newc CPIO: classified from the decompressed
+//     stream and extracted directly;
 //   - xz-compressed ext4 filesystem image (8.0 VM builds): decompressed,
 //     then dumped file-by-file through the pure-Go ext reader.
 func extractRootfsPayload(plain []byte, destDir string) error {
 	switch {
 	case len(plain) >= 2 && plain[0] == 0x1f && plain[1] == 0x8b:
-		return archive.ExtractGzipTar(plain, destDir)
+		return archive.ExtractGzipRootfs(plain, destDir)
 	case len(plain) >= 6 && bytes.Equal(plain[:6], []byte("\xfd7zXZ\x00")):
 		raw, err := archive.XZDecompress(plain)
 		if err != nil {
