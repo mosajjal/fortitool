@@ -1093,6 +1093,25 @@ func (f *FS) ReadFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("diskimage: reading file %q (inode %d): %w", path, num, err)
 	}
+	if in.mode&s_IFMT == s_IFLNK {
+		linkNum := num
+		target, err := f.readSymlinkData(num, in)
+		if err != nil {
+			return nil, fmt.Errorf("diskimage: reading file symlink %q (inode %d): %w", path, num, err)
+		}
+		targetPath, err := sameDirectorySymlinkTarget(path, string(target))
+		if err != nil {
+			return nil, fmt.Errorf("diskimage: reading file symlink %q (inode %d): %w", path, num, err)
+		}
+		num, err = f.resolve(targetPath)
+		if err != nil {
+			return nil, fmt.Errorf("diskimage: resolving file symlink %q (inode %d): %w", path, linkNum, err)
+		}
+		in, err = f.readInode(num)
+		if err != nil {
+			return nil, fmt.Errorf("diskimage: reading file symlink target %q (inode %d): %w", path, num, err)
+		}
+	}
 	if !f.isReg(in) {
 		return nil, fmt.Errorf("diskimage: %q (inode %d) is not a regular file (mode 0x%04X)", path, num, in.mode)
 	}
@@ -1101,6 +1120,24 @@ func (f *FS) ReadFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("diskimage: reading file %q (inode %d): %w", path, num, err)
 	}
 	return data, nil
+}
+
+func sameDirectorySymlinkTarget(filePath, target string) (string, error) {
+	if !strings.HasPrefix(target, "./") || strings.ContainsRune(target, '\x00') || path.IsAbs(target) {
+		return "", fmt.Errorf("unsupported file symlink target %q", target)
+	}
+	cleanTarget := target[2:]
+	if cleanTarget == "" || strings.Contains(cleanTarget, "/") {
+		return "", fmt.Errorf("unsupported file symlink target %q", target)
+	}
+	if err := validateEntryName(cleanTarget); err != nil {
+		return "", fmt.Errorf("unsupported file symlink target %q: %w", target, err)
+	}
+	parts := splitPath(filePath)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("invalid file symlink path %q", filePath)
+	}
+	return path.Join(path.Join(parts[:len(parts)-1]...), cleanTarget), nil
 }
 
 // ReadDir lists the immediate entries of a directory. "" or "/" means root.
