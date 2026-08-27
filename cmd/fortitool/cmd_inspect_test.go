@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mosajjal/fortitool/internal/diskimage"
 	"github.com/ulikunitz/xz"
 	"golang.org/x/crypto/chacha20"
 )
@@ -70,6 +71,15 @@ func TestCmdInspectReadablePartialStagesExitSuccessfully(t *testing.T) {
 		wantUnsupported string
 		wantReason      string
 	}{
+		{
+			name: "corrupt outer gzip",
+			image: func(t *testing.T) []byte {
+				data := gzipBytes(t, []byte("decoded firmware"))
+				return data[:len(data)-4]
+			},
+			wantLast: inspectStageInput, wantUnsupported: inspectStageOuterGzip,
+			wantReason: "gunzip:",
+		},
 		{
 			name:     "empty",
 			image:    func(*testing.T) []byte { return nil },
@@ -266,31 +276,24 @@ func TestInspectAndDecryptConsumeSharedDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection, err := locateVolume(image)
+	selection, err := openVolume(image)
 	if err != nil {
 		t.Fatal(err)
 	}
-	volume, description, err := openVolume(image)
-	if err != nil {
+	if err := selection.RequiredMembers.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if description != selection.description {
-		t.Fatalf("decrypt layout %q != inspect layout %q", description, selection.description)
+	report := newInspectReport()
+	report.setRequiredMembers(selection.RequiredMembers)
+	if report.flatkc != "present (16 bytes)" || report.rootfsGz != "present ("+strconv.Itoa(len(rootfs))+" bytes)" {
+		t.Fatalf("formatted members = %q/%q", report.flatkc, report.rootfsGz)
 	}
-	flatkc, err := volume.ReadFile("flatkc")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rootfsGz, err := selection.Volume.ReadFile("rootfs.gz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	decision, err := decideRootfsCrypto(context.Background(), flatkc, rootfsGz)
+	decision, err := decideRootfsCrypto(context.Background(), selection.RequiredMembers.Flatkc.Data, selection.RequiredMembers.RootfsGz.Data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	decrypted, err := captureStdout(t, func() error {
-		got, err := decryptRootfsAuto(context.Background(), flatkc, rootfsGz, false)
+		got, err := decryptRootfsAuto(context.Background(), selection.RequiredMembers.Flatkc.Data, selection.RequiredMembers.RootfsGz.Data, false)
 		if err == nil && !bytes.Equal(got, decision.Plaintext) {
 			t.Fatal("decrypt and inspect rootfs plaintext decisions differ")
 		}
@@ -315,6 +318,140 @@ func TestInspectAndDecryptConsumeSharedDecisions(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "bin", "init")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRequiredMembersDecisionSharedPresenceMissingAndErrors(t *testing.T) {
+	readFailure := errors.New("synthetic member read failure")
+	tests := []struct {
+		name       string
+		volume     stubVolume
+		wantFlatkc string
+		wantRootfs string
+		wantErr    string
+	}{
+		{
+			name: "present",
+			volume: stubVolume{
+				"flatkc":    {data: []byte("kernel")},
+				"rootfs.gz": {data: []byte("rootfs")},
+			},
+			wantFlatkc: "present (6 bytes)", wantRootfs: "present (6 bytes)",
+		},
+		{
+			name: "missing",
+			volume: stubVolume{
+				"flatkc":    {data: []byte("kernel")},
+				"rootfs.gz": {err: diskimage.ErrNotFound},
+			},
+			wantFlatkc: "present (6 bytes)", wantRootfs: "absent",
+			wantErr: "required member absent: rootfs.gz",
+		},
+		{
+			name: "error",
+			volume: stubVolume{
+				"flatkc":    {err: readFailure},
+				"rootfs.gz": {data: []byte("rootfs")},
+			},
+			wantFlatkc: "unreadable", wantRootfs: "present (6 bytes)",
+			wantErr: "reading required member flatkc: synthetic member read failure",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			decision := readRequiredMembers(tc.volume)
+			report := newInspectReport()
+			report.setRequiredMembers(decision)
+			if report.flatkc != tc.wantFlatkc || report.rootfsGz != tc.wantRootfs {
+				t.Fatalf("formatted members = %q/%q, want %q/%q", report.flatkc, report.rootfsGz, tc.wantFlatkc, tc.wantRootfs)
+			}
+			err := decision.Err()
+			if tc.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestScannedOffsetReportingPreservesDiscoveryKind(t *testing.T) {
+	location := diskimage.FilesystemLocation{
+		Kind: "scanned-offset", Offset: 0x800000, Length: 0x300000,
+	}
+	if got := diskLayoutForLocation("", location); got != "scanned-offset" {
+		t.Fatalf("disk layout = %q, want scanned-offset", got)
+	}
+	if got := formatSelectedVolume(location); got != "scanned offset 8388608 (length 3145728)" {
+		t.Fatalf("selected volume = %q", got)
+	}
+}
+
+func TestCmdInspectReportsDiscoveredVolumeMetadata(t *testing.T) {
+	ext, err := gunzipOuter(syntheticDecryptImage(t, syntheticNewcRootfs(t, true)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name          string
+		image         func([]byte) []byte
+		wantLayout    string
+		wantSelection string
+	}{
+		{
+			name: "partitioned",
+			image: func(ext []byte) []byte {
+				return buildPartitionedDisk(ext)
+			},
+			wantLayout:    "partitioned",
+			wantSelection: "partition 1 (offset 512, length 10240)",
+		},
+		{
+			name: "fixed offset",
+			image: func(ext []byte) []byte {
+				return buildOffsetDisk(ext, 0x100000)
+			},
+			wantLayout:    "fixed-offset",
+			wantSelection: "fixed offset 1048576 (length 10240)",
+		},
+		{
+			name: "scanned offset",
+			image: func(ext []byte) []byte {
+				return buildOffsetDisk(ext, 0x800000)
+			},
+			wantLayout:    "scanned-offset",
+			wantSelection: "scanned offset 8388608 (length 10240)",
+		},
+		{
+			name: "qcow2 partition",
+			image: func(ext []byte) []byte {
+				return buildQCOW2Disk(buildPartitionedDisk(ext))
+			},
+			wantLayout:    "qcow2",
+			wantSelection: "partition 1 (offset 512, length 10240)",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := filepath.Join(t.TempDir(), "firmware.out")
+			if err := os.WriteFile(input, gzipBytes(t, tc.image(ext)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			result := runCLISubprocess(t, []string{"inspect", input}, "")
+			if result.code != 0 {
+				t.Fatalf("exit = %d\nstdout:\n%s\nstderr:\n%s", result.code, result.stdout, result.stderr)
+			}
+			for _, want := range []string{
+				"disk-layout: " + tc.wantLayout + "\n",
+				"selected-volume: " + tc.wantSelection + "\n",
+				"status: complete\n",
+			} {
+				if !strings.Contains(result.stdout, want) {
+					t.Fatalf("stdout does not contain %q:\n%s", want, result.stdout)
+				}
+			}
+		})
 	}
 }
 
@@ -387,6 +524,57 @@ func rewriteGzipPrefix(t *testing.T, data, prefix []byte) []byte {
 	}
 	copy(plain, prefix)
 	return gzipBytes(t, plain)
+}
+
+type stubMember struct {
+	data []byte
+	err  error
+}
+
+type stubVolume map[string]stubMember
+
+func (v stubVolume) ReadFile(name string) ([]byte, error) {
+	member, ok := v[name]
+	if !ok {
+		return nil, diskimage.ErrNotFound
+	}
+	return member.data, member.err
+}
+
+func buildPartitionedDisk(ext []byte) []byte {
+	disk := make([]byte, 512+len(ext))
+	copy(disk[512:], ext)
+	disk[510] = 0x55
+	disk[511] = 0xaa
+	entry := disk[446:462]
+	entry[4] = 0x83
+	binary.LittleEndian.PutUint32(entry[8:12], 1)
+	binary.LittleEndian.PutUint32(entry[12:16], uint32(len(ext)/512))
+	return disk
+}
+
+func buildOffsetDisk(ext []byte, offset int) []byte {
+	disk := make([]byte, offset+len(ext))
+	copy(disk[offset:], ext)
+	return disk
+}
+
+func buildQCOW2Disk(guest []byte) []byte {
+	const (
+		clusterBits = 16
+		clusterSize = 1 << clusterBits
+	)
+	image := make([]byte, 4*clusterSize)
+	copy(image[:4], []byte{'Q', 'F', 'I', 0xfb})
+	binary.BigEndian.PutUint32(image[4:8], 3)
+	binary.BigEndian.PutUint32(image[20:24], clusterBits)
+	binary.BigEndian.PutUint64(image[24:32], clusterSize)
+	binary.BigEndian.PutUint32(image[36:40], 1)
+	binary.BigEndian.PutUint64(image[40:48], clusterSize)
+	binary.BigEndian.PutUint64(image[clusterSize:clusterSize+8], 2*clusterSize)
+	binary.BigEndian.PutUint64(image[2*clusterSize:2*clusterSize+8], 3*clusterSize)
+	copy(image[3*clusterSize:], guest)
+	return image
 }
 
 func encryptSyntheticL1(plain, key []byte) []byte {

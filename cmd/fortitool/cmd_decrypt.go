@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mosajjal/fortitool/internal/archive"
 	"github.com/mosajjal/fortitool/internal/diskimage"
@@ -109,37 +110,23 @@ EXIT CODES
 	}
 
 	fmt.Println("[3/6] locating the FORTIOS volume")
-	volume, layout, err := openVolume(plain)
+	selection, err := openVolume(plain)
 	if err != nil {
 		return fmt.Errorf("volume discovery: %w", err)
 	}
-	fmt.Printf("      layout: %s\n", terminalText(layout))
-
-	extract := func(name string) ([]byte, error) {
-		data, err := volume.ReadFile(name)
-		if errors.Is(err, diskimage.ErrNotFound) {
-			return nil, nil // absent -- not every image carries every optional file
-		}
-		return data, err
+	fmt.Printf("      layout: %s\n", terminalText(selection.description))
+	if err := selection.RequiredMembers.Err(); err != nil {
+		return err
 	}
-
-	flatkc, err := extract("flatkc")
-	if err != nil {
-		return fmt.Errorf("reading flatkc: %w", err)
-	}
-	rootfsGz, err := extract("rootfs.gz")
-	if err != nil {
-		return fmt.Errorf("reading rootfs.gz: %w", err)
-	}
-	if flatkc == nil || rootfsGz == nil {
-		return fmt.Errorf("flatkc or rootfs.gz not found in the located volume")
-	}
+	volume := selection.Volume
+	flatkc := selection.RequiredMembers.Flatkc.Data
+	rootfsGz := selection.RequiredMembers.RootfsGz.Data
 	if err := os.WriteFile(filepath.Join(staged.temp, "flatkc"), flatkc, 0o644); err != nil {
 		return err
 	}
 
 	for _, extra := range []string{"datafs.tar.gz", "devicetree.dtb", "filechecksum", "hash_bin.sha256", "split_rootfs.tar.xz", ".db"} {
-		data, err := extract(extra)
+		data, err := readOptionalMember(volume, extra)
 		if err != nil {
 			return fmt.Errorf("reading %s: %w", extra, err)
 		}
@@ -257,18 +244,78 @@ func extractDatafs(outputDir string) (bool, error) {
 // When several candidate volumes exist (partitioned VM disks), the one
 // actually containing flatkc + rootfs.gz wins.
 type volumeSelection struct {
-	Volume      *diskimage.FS
-	DiskLayout  string
-	Location    diskimage.FilesystemLocation
-	description string
+	Volume          *diskimage.FS
+	DiskLayout      string
+	Location        diskimage.FilesystemLocation
+	RequiredMembers requiredMembersDecision
+	description     string
 }
 
-func openVolume(img []byte) (*diskimage.FS, string, error) {
-	selection, err := locateVolume(img)
-	if err != nil {
-		return nil, "", err
+type volumeFileReader interface {
+	ReadFile(string) ([]byte, error)
+}
+
+type memberDecision struct {
+	Name string
+	Data []byte
+	Err  error
+}
+
+type requiredMembersDecision struct {
+	Flatkc   memberDecision
+	RootfsGz memberDecision
+}
+
+func readRequiredMembers(volume volumeFileReader) requiredMembersDecision {
+	return requiredMembersDecision{
+		Flatkc:   readMember(volume, "flatkc"),
+		RootfsGz: readMember(volume, "rootfs.gz"),
 	}
-	return selection.Volume, selection.description, nil
+}
+
+func readMember(volume volumeFileReader, name string) memberDecision {
+	data, err := volume.ReadFile(name)
+	return memberDecision{Name: name, Data: data, Err: err}
+}
+
+func (d requiredMembersDecision) Err() error {
+	var missing []string
+	for _, member := range []memberDecision{d.Flatkc, d.RootfsGz} {
+		switch {
+		case member.Err == nil:
+		case errors.Is(member.Err, diskimage.ErrNotFound):
+			missing = append(missing, member.Name)
+		default:
+			return fmt.Errorf("reading required member %s: %w", member.Name, member.Err)
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("required member absent: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (m memberDecision) reportValue() string {
+	switch {
+	case m.Err == nil:
+		return fmt.Sprintf("present (%d bytes)", len(m.Data))
+	case errors.Is(m.Err, diskimage.ErrNotFound):
+		return "absent"
+	default:
+		return "unreadable"
+	}
+}
+
+func readOptionalMember(volume volumeFileReader, name string) ([]byte, error) {
+	member := readMember(volume, name)
+	if errors.Is(member.Err, diskimage.ErrNotFound) {
+		return nil, nil
+	}
+	return member.Data, member.Err
+}
+
+func openVolume(img []byte) (*volumeSelection, error) {
+	return locateVolume(img)
 }
 
 func locateVolume(img []byte) (*volumeSelection, error) {
@@ -294,33 +341,40 @@ func locateVolume(img []byte) (*volumeSelection, error) {
 		return nil, fmt.Errorf("no ext2/3/4 filesystem found in the decrypted image (tried MBR partitions, offset 512, and common fixed offsets)")
 	}
 	selectVolume := func(located diskimage.LocatedFilesystem) *volumeSelection {
-		layout := diskLayout
-		if layout == "" {
-			switch located.Location.Kind {
-			case "mbr-partition":
-				layout = "partitioned"
-			case "raw":
-				layout = "raw"
-			default:
-				layout = "fixed-offset"
-			}
-		}
 		return &volumeSelection{
-			Volume: located.FS, DiskLayout: layout, Location: located.Location, description: description,
+			Volume: located.FS, DiskLayout: diskLayoutForLocation(diskLayout, located.Location),
+			Location: located.Location, RequiredMembers: readRequiredMembers(located.FS), description: description,
 		}
 	}
+	var first *volumeSelection
 	for _, located := range volumes {
-		if _, err := located.FS.ReadFile("flatkc"); err != nil {
-			continue
+		selection := selectVolume(located)
+		if first == nil {
+			first = selection
 		}
-		if _, err := located.FS.ReadFile("rootfs.gz"); err != nil {
-			continue
+		if selection.RequiredMembers.Err() == nil {
+			return selection, nil
 		}
-		return selectVolume(located), nil
 	}
 	// no volume has both files; hand back the first so the caller can
 	// produce a precise error about what IS there
-	return selectVolume(volumes[0]), nil
+	return first, nil
+}
+
+func diskLayoutForLocation(containerLayout string, location diskimage.FilesystemLocation) string {
+	if containerLayout != "" {
+		return containerLayout
+	}
+	switch location.Kind {
+	case "mbr-partition":
+		return "partitioned"
+	case "raw":
+		return "raw"
+	case "fixed-offset", "scanned-offset":
+		return location.Kind
+	default:
+		return "unknown"
+	}
 }
 
 // extractRootfsPayload unpacks a decrypted rootfs body. Two container

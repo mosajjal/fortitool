@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/mosajjal/fortitool/internal/diskimage"
 	"github.com/mosajjal/fortitool/internal/l1"
@@ -177,7 +176,7 @@ EXIT CODES
 	}
 	report.lastStage = inspectStageL1
 
-	selection, err := locateVolume(plain)
+	selection, err := openVolume(plain)
 	if err != nil {
 		report.stop(inspectStageL1, inspectStageVolume, err)
 		report.print()
@@ -187,36 +186,15 @@ EXIT CODES
 	report.selectedVolume = formatSelectedVolume(selection.Location)
 	report.lastStage = inspectStageVolume
 
-	flatkc, flatkcState, flatkcErr := inspectRequiredMember(selection.Volume, "flatkc")
-	rootfsGz, rootfsState, rootfsErr := inspectRequiredMember(selection.Volume, "rootfs.gz")
-	report.flatkc = flatkcState
-	report.rootfsGz = rootfsState
-	if flatkcErr != nil || rootfsErr != nil {
-		if flatkcErr != nil {
-			err = flatkcErr
-		} else {
-			err = rootfsErr
-		}
+	report.setRequiredMembers(selection.RequiredMembers)
+	if err := selection.RequiredMembers.Err(); err != nil {
 		report.stop(inspectStageVolume, inspectStageRequiredMembers, err)
-		report.print()
-		return nil
-	}
-	var missing []string
-	if flatkc == nil {
-		missing = append(missing, "flatkc")
-	}
-	if rootfsGz == nil {
-		missing = append(missing, "rootfs.gz")
-	}
-	if len(missing) != 0 {
-		report.stop(inspectStageVolume, inspectStageRequiredMembers,
-			fmt.Errorf("required member absent: %s", strings.Join(missing, ", ")))
 		report.print()
 		return nil
 	}
 	report.lastStage = inspectStageRequiredMembers
 
-	crypto, err := decideRootfsCrypto(ctx, flatkc, rootfsGz)
+	crypto, err := decideRootfsCrypto(ctx, selection.RequiredMembers.Flatkc.Data, selection.RequiredMembers.RootfsGz.Data)
 	if err != nil {
 		report.stop(inspectStageRequiredMembers, inspectStageRootfsCrypto, err)
 		report.print()
@@ -242,15 +220,9 @@ func (r *inspectReport) setRootfsCrypto(decision *rootfsDecision) {
 	r.rootfsCipher = decision.Cipher
 }
 
-func inspectRequiredMember(volume *diskimage.FS, name string) ([]byte, string, error) {
-	data, err := volume.ReadFile(name)
-	if errors.Is(err, diskimage.ErrNotFound) {
-		return nil, "absent", nil
-	}
-	if err != nil {
-		return nil, "unreadable", fmt.Errorf("reading required member %s: %w", name, err)
-	}
-	return data, fmt.Sprintf("present (%d bytes)", len(data)), nil
+func (r *inspectReport) setRequiredMembers(decision requiredMembersDecision) {
+	r.flatkc = decision.Flatkc.reportValue()
+	r.rootfsGz = decision.RootfsGz.reportValue()
 }
 
 func formatSelectedVolume(location diskimage.FilesystemLocation) string {
@@ -261,7 +233,9 @@ func formatSelectedVolume(location diskimage.FilesystemLocation) string {
 		return fmt.Sprintf("raw filesystem (offset %d, length %d)", location.Offset, location.Length)
 	case "fixed-offset":
 		return fmt.Sprintf("fixed offset %d (length %d)", location.Offset, location.Length)
-	default:
+	case "scanned-offset":
 		return fmt.Sprintf("scanned offset %d (length %d)", location.Offset, location.Length)
+	default:
+		return fmt.Sprintf("unknown volume (offset %d, length %d)", location.Offset, location.Length)
 	}
 }
