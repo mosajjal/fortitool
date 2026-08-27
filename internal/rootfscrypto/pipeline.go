@@ -1,10 +1,13 @@
 package rootfscrypto
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"math/big"
 )
 
@@ -46,7 +49,7 @@ func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result
 		return nil, err
 	}
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no seed/RSA-key material found in kernel payload (%d bytes)", len(kernelPayload))
+		return decryptStaticChaCha20(ctx, kernelPayload, rootfsGz)
 	}
 
 	var matches []*Result
@@ -92,8 +95,10 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 
 	bodyHash := sha256.Sum256(body)
 
-	if r := tryAESCTR(payload, body, bodyHash[:]); r != nil {
-		r.Seed = sm
+	if r, handled := tryAESCTR(payload, body, bodyHash[:]); handled {
+		if r != nil {
+			r.Seed = sm
+		}
 		return r, true
 	}
 	if r := tryChaCha20Body(sm, body, bodyHash[:]); r != nil {
@@ -108,6 +113,9 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 	return nil, true
 }
 
+// chachaBodySplits contains only splits observed for rootfs body encryption.
+var chachaBodySplits = [][2]int{{5, 2}, {4, 5}, {3, 1}, {5, 5}, {2, 5}, {1, 3}, {3, 2}, {4, 2}, {5, 3}, {2, 3}}
+
 // tryChaCha20Body handles the 7.4.1-7.4.3 era (Bishop Fox "Further
 // Adventures", Optistream fortigate-crypto): the rootfs body itself is
 // ChaCha20-encrypted with key = SHA256(rot_k(seed)) and 16-byte IV =
@@ -119,7 +127,7 @@ func tryChaCha20Body(sm *SeedMaterial, body, bodyHash []byte) *Result {
 	if probeLen > len(body) {
 		probeLen = len(body)
 	}
-	for _, split := range chachaSplits {
+	for _, split := range chachaBodySplits {
 		ks := chacha20Keystream(sm.Seed, split[0], split[1], probeLen)
 		probe := make([]byte, probeLen)
 		for i := range probe {
@@ -141,10 +149,125 @@ func tryChaCha20Body(sm *SeedMaterial, body, bodyHash []byte) *Result {
 	return nil
 }
 
-// tryAESCTR handles the two known field orderings of the AES-CTR signature
-// payload: [hash|counter|aes_key] (x86_64, fgx) and [counter|aes_key|hash]
-// (ARM FSoC3, this repo).
-func tryAESCTR(payload, body, bodyHash []byte) *Result {
+func tryAESCTR(payload, body, bodyHash []byte) (*Result, bool) {
+	if r, handled := tryAESCTRKeyBeforeCounter(payload, body, bodyHash); handled {
+		return r, true
+	}
+	if r := tryAESCTRLegacy(payload, body, bodyHash); r != nil {
+		return r, true
+	}
+	return nil, false
+}
+
+// Some 80-byte payloads place the 32-byte key immediately before the
+// 16-byte counter, with the ciphertext digest at either end.
+func tryAESCTRKeyBeforeCounter(payload, body, bodyHash []byte) (*Result, bool) {
+	if len(payload) < 80 {
+		return nil, false
+	}
+	type layout struct {
+		name              string
+		hash, aeskey, ctr []byte
+	}
+	layouts := []layout{
+		{"hash|aeskey|counter", payload[0:32], payload[32:64], payload[64:80]},
+		{"aeskey|counter|hash", payload[48:80], payload[0:32], payload[32:48]},
+	}
+	var candidates []layout
+	for _, l := range layouts {
+		probeLen := 64
+		if probeLen > len(body) {
+			probeLen = len(body)
+		}
+		probe := aesCustomCTR(l.aeskey, l.ctr[:8], getLE64(l.ctr[8:16]), counterStep(l.ctr), body[:probeLen])
+		if !plausibleBody(probe) {
+			continue
+		}
+		candidates = append(candidates, l)
+	}
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	if len(candidates) != 1 || len(payload) != 80 {
+		return nil, true
+	}
+	l := candidates[0]
+	if !bytes.Equal(l.hash, bodyHash) {
+		return nil, true
+	}
+	plain := aesCustomCTR(l.aeskey, l.ctr[:8], getLE64(l.ctr[8:16]), counterStep(l.ctr), body)
+	if !validCompleteGzipTar(plain) {
+		return nil, true
+	}
+	return &Result{
+		Plaintext: plain, Cipher: "aes-ctr", HashOK: true,
+		KeyDetail: fmt.Sprintf("layout=%s aes_key=%x", l.name, l.aeskey),
+	}, true
+}
+
+func validCompleteGzipTar(data []byte) bool {
+	// A standard tar record is 20 blocks; tar.Reader consumes two end blocks.
+	const maxTarRecordPadding = 18 * 512
+
+	compressed := bytes.NewReader(data)
+	gz, err := gzip.NewReader(compressed)
+	if err != nil {
+		return false
+	}
+	gz.Multistream(false)
+	counted := &countingReader{r: gz}
+	tr := tar.NewReader(counted)
+	for {
+		memberEnd := counted.n
+		_, err := tr.Next()
+		if err == io.EOF {
+			padding := (512 - memberEnd%512) % 512
+			if counted.n-memberEnd != padding+1024 {
+				_ = gz.Close()
+				return false
+			}
+			break
+		}
+		if err != nil {
+			_ = gz.Close()
+			return false
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			_ = gz.Close()
+			return false
+		}
+	}
+	padding := &zeroCheckingWriter{}
+	n, err := io.Copy(padding, io.LimitReader(gz, maxTarRecordPadding+1))
+	closeErr := gz.Close()
+	return err == nil && n <= maxTarRecordPadding && !padding.nonZero && closeErr == nil && compressed.Len() == 0
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+type zeroCheckingWriter struct {
+	nonZero bool
+}
+
+func (w *zeroCheckingWriter) Write(p []byte) (int, error) {
+	for _, b := range p {
+		if b != 0 {
+			w.nonZero = true
+		}
+	}
+	return len(p), nil
+}
+
+func tryAESCTRLegacy(payload, body, bodyHash []byte) *Result {
 	if len(payload) < 80 {
 		return nil
 	}

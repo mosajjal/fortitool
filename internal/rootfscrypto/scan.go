@@ -3,12 +3,14 @@
 // RSAPublicKey DER blob hidden somewhere in the kernel (flatkc), used to
 // unwrap a per-image AES/RC4 key carried in rootfs.gz's trailing signature.
 //
-// Two obfuscation families are known, and this package auto-detects both
-// without any disassembly (miasm/objdump), by exploiting that the blob
-// always decrypts to a known ASN.1 DER prefix:
+// Three storage families are known, and this package auto-detects them
+// without any disassembly (miasm/objdump). The seed/RSA families exploit
+// that the blob always decrypts to a known ASN.1 DER prefix:
 //   - XOR family (7.6.x aarch64, 8.0 FORT-RC4): blob[i] ^ seed[i&0x1F]
-//   - ChaCha20 family (7.4.1-7.4.11, ARM+x86): key/iv = SHA256 of seed with
+//   - ChaCha20 family (ARM+x86): key/iv = SHA256 of seed with
 //     one of several observed byte-rotation splits
+//   - static ChaCha20 family: aligned key(32)+counter/nonce(16), selected only
+//     when the complete decrypted body is a valid gzip-compressed tar
 package rootfscrypto
 
 import (
@@ -35,10 +37,10 @@ var derPrefix8 = [8]byte{0x30, 0x82, 0x01, 0x0a, 0x02, 0x82, 0x01, 0x01}
 // ASN.1 INTEGER, present at the end of every 270-byte blob we've observed.
 var derSuffix5 = [5]byte{0x02, 0x03, 0x01, 0x00, 0x01}
 
-// chachaSplits are the seed byte-rotation splits (key-split, iv-split)
-// observed across FortiOS builds/architectures (RandoriSec, fgx, and this
-// repo's own FSoC3/ARM finding of (5,2)).
-var chachaSplits = [][2]int{{5, 2}, {4, 5}, {3, 1}, {5, 5}, {2, 5}, {1, 3}, {3, 2}, {4, 2}, {5, 3}, {2, 3}}
+// chachaKeySplits are the seed byte-rotation splits (key-split, iv-split)
+// observed for RSA key-material obfuscation across FortiOS builds and
+// architectures (RandoriSec, fgx, and this repo's own findings).
+var chachaKeySplits = [][2]int{{5, 2}, {4, 5}, {3, 1}, {5, 5}, {2, 5}, {1, 3}, {3, 2}, {4, 2}, {5, 3}, {2, 3}, {6, 3}}
 
 // SeedMaterial is a located, decrypted seed+RSA-key pair.
 type SeedMaterial struct {
@@ -256,7 +258,7 @@ func scanChaChaFamily(ctx context.Context, data []byte) []*SeedMaterial {
 				if lowEntropySeed(seed) {
 					continue
 				}
-				for _, split := range chachaSplits {
+				for _, split := range chachaKeySplits {
 					var k winKey
 					copy(k[:], chacha20Keystream(seed, split[0], split[1], 8))
 					blobOffs, ok := wanted[k]

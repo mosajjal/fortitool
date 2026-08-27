@@ -1,7 +1,9 @@
 package rootfscrypto
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -86,6 +88,17 @@ func embedXORCandidate(t *testing.T, kernel []byte, offset int, key testRSAKey) 
 	return seed
 }
 
+func embedChaChaCandidate(t *testing.T, kernel []byte, seedOffset, blobOffset int, key testRSAKey, split [2]int) []byte {
+	t.Helper()
+	seed := make([]byte, seedLen)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	copy(kernel[seedOffset:seedOffset+seedLen], seed)
+	copy(kernel[blobOffset:blobOffset+blobLen], chacha20Decrypt(seed, split[0], split[1], key.der))
+	return seed
+}
+
 func buildModifiedRC4Rootfs(t *testing.T, key testRSAKey) ([]byte, []byte) {
 	t.Helper()
 	plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("synthetic-rootfs"), 64)...)
@@ -101,6 +114,121 @@ func buildModifiedRC4Rootfs(t *testing.T, key testRSAKey) ([]byte, []byte) {
 	return append(body, sig...), plaintext
 }
 
+func buildGzipTar(t *testing.T) []byte {
+	t.Helper()
+	return gzipBytes(t, buildTar(t))
+}
+
+func buildTar(t *testing.T) []byte {
+	t.Helper()
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	content := bytes.Repeat([]byte("synthetic-rootfs"), 128)
+	if err := tw.WriteHeader(&tar.Header{Name: "bin/init", Mode: 0o755, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return archive.Bytes()
+}
+
+func gzipBytes(t *testing.T, plaintext []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	if _, err := gz.Write(plaintext); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+func buildSignedRootfs(t *testing.T, key testRSAKey, body, payload []byte) []byte {
+	t.Helper()
+	modLen := (key.priv.N.BitLen() + 7) / 8
+	sig := signAsRSAPublicOp(pkcs1Wrap(payload, modLen), key.priv)
+	return append(append([]byte(nil), body...), sig...)
+}
+
+func buildKeyBeforeCounterRootfs(t *testing.T, key testRSAKey, layout string, plaintext, encryptKey, payloadKey, counter []byte, mismatchHash bool) []byte {
+	t.Helper()
+	body := aesCustomCTR(encryptKey, counter[:8], getLE64(counter[8:16]), counterStep(counter), plaintext)
+	hash := sha256.Sum256(body)
+	if mismatchHash {
+		hash[0] ^= 0xff
+	}
+	payload := make([]byte, 0, 80)
+	switch layout {
+	case "prefix":
+		payload = append(payload, hash[:]...)
+		payload = append(payload, payloadKey...)
+		payload = append(payload, counter...)
+	case "suffix":
+		payload = append(payload, payloadKey...)
+		payload = append(payload, counter...)
+		payload = append(payload, hash[:]...)
+	default:
+		t.Fatalf("unknown layout %q", layout)
+	}
+	return buildSignedRootfs(t, key, body, payload)
+}
+
+func aesLayoutMaterial(payload []byte, layout string) ([]byte, []byte) {
+	var key, counter []byte
+	switch layout {
+	case "new-prefix":
+		key, counter = payload[32:64], payload[64:80]
+	case "new-suffix":
+		key, counter = payload[0:32], payload[32:48]
+	case "legacy-prefix":
+		key, counter = payload[48:80], payload[32:48]
+	case "legacy-suffix":
+		key, counter = payload[16:48], payload[0:16]
+	default:
+		panic("unknown AES layout")
+	}
+	return key, counter
+}
+
+func buildOverlappingAESPayload(t *testing.T, first, second string) ([]byte, []byte) {
+	t.Helper()
+	payload := make([]byte, 80)
+	a := bytes.Repeat([]byte{0x11}, 16)
+	b := bytes.Repeat([]byte{0x22}, 16)
+	switch first + "/" + second {
+	case "new-prefix/legacy-prefix":
+		copy(payload[32:48], a)
+		copy(payload[48:64], a)
+		copy(payload[64:80], a)
+	case "new-suffix/legacy-suffix":
+		copy(payload[0:16], a)
+		copy(payload[16:32], a)
+		copy(payload[32:48], a)
+	case "new-prefix/new-suffix":
+		copy(payload[0:16], a)
+		copy(payload[16:32], b)
+		copy(payload[32:48], a)
+		copy(payload[48:64], b)
+		copy(payload[64:80], a)
+	default:
+		t.Fatalf("unsupported overlap %s/%s", first, second)
+	}
+	firstKey, firstCounter := aesLayoutMaterial(payload, first)
+	body := aesCustomCTR(firstKey, firstCounter[:8], getLE64(firstCounter[8:16]), counterStep(firstCounter), buildGzipTar(t))
+	secondKey, secondCounter := aesLayoutMaterial(payload, second)
+	secondPlain := aesCustomCTR(secondKey, secondCounter[:8], getLE64(secondCounter[8:16]), counterStep(secondCounter), body)
+	if !validCompleteGzipTar(secondPlain) {
+		t.Fatalf("generated payload does not overlap %s/%s", first, second)
+	}
+	return body, payload
+}
+
 func TestDecryptRootfs_ChaChaFamily_AESCTR(t *testing.T) {
 	key := genTestRSAKey(t)
 
@@ -108,7 +236,7 @@ func TestDecryptRootfs_ChaChaFamily_AESCTR(t *testing.T) {
 	if _, err := rand.Read(seed); err != nil {
 		t.Fatal(err)
 	}
-	split := chachaSplits[0] // (5,2), the FSoC3/ARM finding this repo made
+	split := chachaKeySplits[0] // (5,2), the FSoC3/ARM finding this repo made
 	encBlob := chacha20Decrypt(seed, split[0], split[1], key.der)
 
 	kernelPayload := make([]byte, 4096)
@@ -152,6 +280,246 @@ func TestDecryptRootfs_ChaChaFamily_AESCTR(t *testing.T) {
 	}
 	if res.Seed.Family != "chacha20" {
 		t.Fatalf("family = %q, want chacha20", res.Seed.Family)
+	}
+}
+
+func TestDecryptRootfs_AESCTRKeyBeforeCounter(t *testing.T) {
+	for _, layout := range []string{"prefix", "suffix"} {
+		t.Run(layout, func(t *testing.T) {
+			key := genTestRSAKey(t)
+			kernel := make([]byte, 2048)
+			if _, err := rand.Read(kernel); err != nil {
+				t.Fatal(err)
+			}
+			embedXORCandidate(t, kernel, 256, key)
+			plaintext := buildGzipTar(t)
+			aesKey := make([]byte, 32)
+			counter := make([]byte, 16)
+			if _, err := rand.Read(aesKey); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rand.Read(counter); err != nil {
+				t.Fatal(err)
+			}
+			rootfs := buildKeyBeforeCounterRootfs(t, key, layout, plaintext, aesKey, aesKey, counter, false)
+
+			res, err := DecryptRootfs(context.Background(), kernel, rootfs)
+			if err != nil {
+				t.Fatalf("DecryptRootfs: %v", err)
+			}
+			if !bytes.Equal(res.Plaintext, plaintext) {
+				t.Fatal("plaintext mismatch")
+			}
+			if res.Cipher != "aes-ctr" || !res.HashOK {
+				t.Fatalf("cipher=%q hashOK=%v, want aes-ctr/true", res.Cipher, res.HashOK)
+			}
+			if !strings.Contains(res.KeyDetail, "layout=") {
+				t.Fatalf("missing layout detail: %q", res.KeyDetail)
+			}
+		})
+	}
+}
+
+func TestDecryptRootfsRejectsInvalidAESCTRKeyBeforeCounter(t *testing.T) {
+	tests := []struct {
+		name         string
+		mutatePlain  func([]byte) []byte
+		wrongKey     bool
+		mismatchHash bool
+	}{
+		{
+			name: "corrupt-gzip-crc",
+			mutatePlain: func(plaintext []byte) []byte {
+				plaintext[len(plaintext)-8] ^= 0xff
+				return plaintext
+			},
+		},
+		{
+			name: "truncated-gzip",
+			mutatePlain: func(plaintext []byte) []byte {
+				return plaintext[:len(plaintext)-4]
+			},
+		},
+		{
+			name: "trailing-data",
+			mutatePlain: func(plaintext []byte) []byte {
+				return append(plaintext, 0x42)
+			},
+		},
+		{name: "wrong-key", wrongKey: true},
+		{name: "hash-mismatch", mismatchHash: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			key := genTestRSAKey(t)
+			kernel := make([]byte, 2048)
+			if _, err := rand.Read(kernel); err != nil {
+				t.Fatal(err)
+			}
+			embedXORCandidate(t, kernel, 256, key)
+			plaintext := buildGzipTar(t)
+			if test.mutatePlain != nil {
+				plaintext = test.mutatePlain(append([]byte(nil), plaintext...))
+			}
+			encryptKey := make([]byte, 32)
+			payloadKey := encryptKey
+			counter := make([]byte, 16)
+			if _, err := rand.Read(encryptKey); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rand.Read(counter); err != nil {
+				t.Fatal(err)
+			}
+			if test.wrongKey {
+				payloadKey = make([]byte, 32)
+				if _, err := rand.Read(payloadKey); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rootfs := buildKeyBeforeCounterRootfs(t, key, "prefix", plaintext, encryptKey, payloadKey, counter, test.mismatchHash)
+			if _, err := DecryptRootfs(context.Background(), kernel, rootfs); err == nil {
+				t.Fatal("expected invalid key-before-counter payload to be rejected")
+			}
+		})
+	}
+}
+
+func TestTryAESCTRKeyBeforeCounterRejectsInexactPayloadAndMagicOnly(t *testing.T) {
+	plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte{0x42}, 64)...)
+	aesKey := make([]byte, 32)
+	counter := make([]byte, 16)
+	if _, err := rand.Read(aesKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(counter); err != nil {
+		t.Fatal(err)
+	}
+	body := aesCustomCTR(aesKey, counter[:8], getLE64(counter[8:16]), counterStep(counter), plaintext)
+	hash := sha256.Sum256(body)
+	payload := append(append(append([]byte{}, hash[:]...), aesKey...), counter...)
+	if result, handled := tryAESCTRKeyBeforeCounter(payload, body, hash[:]); result != nil || !handled {
+		t.Fatalf("magic-only result=%v handled=%v, want nil/true", result, handled)
+	}
+	if result, handled := tryAESCTRKeyBeforeCounter(append(payload, 0), body, hash[:]); result != nil || !handled {
+		t.Fatalf("inexact payload result=%v handled=%v, want nil/true", result, handled)
+	}
+}
+
+func TestDecryptRootfsRejectsOverlappingNewAESCTRFailures(t *testing.T) {
+	tests := []struct {
+		name, strictLayout, legacyLayout string
+		inexact                          bool
+	}{
+		{"prefix-hash-mismatch", "new-prefix", "legacy-prefix", false},
+		{"suffix-hash-mismatch", "new-suffix", "legacy-suffix", false},
+		{"prefix-inexact", "new-prefix", "legacy-prefix", true},
+		{"suffix-inexact", "new-suffix", "legacy-suffix", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			key := genTestRSAKey(t)
+			kernel := make([]byte, 2048)
+			if _, err := rand.Read(kernel); err != nil {
+				t.Fatal(err)
+			}
+			embedXORCandidate(t, kernel, 256, key)
+			body, payload := buildOverlappingAESPayload(t, test.strictLayout, test.legacyLayout)
+			digest := sha256.Sum256(body)
+			if test.strictLayout == "new-prefix" {
+				copy(payload[:32], digest[:])
+				if !test.inexact {
+					payload[0] ^= 0xff
+				}
+			} else {
+				copy(payload[48:80], digest[:])
+				if !test.inexact {
+					payload[48] ^= 0xff
+				}
+			}
+			if test.inexact {
+				payload = append(payload, 0)
+			}
+			rootfs := buildSignedRootfs(t, key, body, payload)
+			if _, err := DecryptRootfs(context.Background(), kernel, rootfs); err == nil {
+				t.Fatal("expected strict AES layout failure to block legacy fallback")
+			}
+		})
+	}
+}
+
+func TestDecryptRootfsRejectsIncompleteTarTermination(t *testing.T) {
+	complete := buildTar(t)
+	if len(complete) < 1024 || !bytes.Equal(complete[len(complete)-1024:], make([]byte, 1024)) {
+		t.Fatal("generated tar lacks two zero end records")
+	}
+	tests := []struct {
+		name      string
+		plaintext []byte
+	}{
+		{"one-zero-block", gzipBytes(t, complete[:len(complete)-512])},
+		{"no-zero-blocks", gzipBytes(t, complete[:len(complete)-1024])},
+		{"trailing-bomb", gzipBytes(t, append(append([]byte(nil), complete...), bytes.Repeat([]byte{0x42}, 1<<20)...))},
+		{"zero-padding-bomb", gzipBytes(t, append(append([]byte(nil), complete...), make([]byte, 19*512)...))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			key := genTestRSAKey(t)
+			kernel := make([]byte, 2048)
+			if _, err := rand.Read(kernel); err != nil {
+				t.Fatal(err)
+			}
+			embedXORCandidate(t, kernel, 256, key)
+			aesKey := make([]byte, 32)
+			counter := make([]byte, 16)
+			if _, err := rand.Read(aesKey); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rand.Read(counter); err != nil {
+				t.Fatal(err)
+			}
+			rootfs := buildKeyBeforeCounterRootfs(t, key, "prefix", test.plaintext, aesKey, aesKey, counter, false)
+			if _, err := DecryptRootfs(context.Background(), kernel, rootfs); err == nil {
+				t.Fatal("expected incomplete or trailing tar data to be rejected")
+			}
+		})
+	}
+}
+
+func TestDecryptRootfsRejectsAmbiguousAESCTRLayouts(t *testing.T) {
+	key := genTestRSAKey(t)
+	kernel := make([]byte, 2048)
+	if _, err := rand.Read(kernel); err != nil {
+		t.Fatal(err)
+	}
+	embedXORCandidate(t, kernel, 256, key)
+	body, payload := buildOverlappingAESPayload(t, "new-prefix", "new-suffix")
+	rootfs := buildSignedRootfs(t, key, body, payload)
+	if _, err := DecryptRootfs(context.Background(), kernel, rootfs); err == nil {
+		t.Fatal("expected ambiguous strict AES layouts to be rejected")
+	}
+}
+
+func TestDecryptRootfsRejectsAmbiguousAESCTRKeyBeforeCounter(t *testing.T) {
+	key := genTestRSAKey(t)
+	kernel := make([]byte, 4096)
+	if _, err := rand.Read(kernel); err != nil {
+		t.Fatal(err)
+	}
+	embedXORCandidate(t, kernel, 256, key)
+	embedXORCandidate(t, kernel, 1024, key)
+	plaintext := buildGzipTar(t)
+	aesKey := make([]byte, 32)
+	counter := make([]byte, 16)
+	if _, err := rand.Read(aesKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(counter); err != nil {
+		t.Fatal(err)
+	}
+	rootfs := buildKeyBeforeCounterRootfs(t, key, "suffix", plaintext, aesKey, aesKey, counter, false)
+	_, err := DecryptRootfs(context.Background(), kernel, rootfs)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("expected ambiguous-match error, got %v", err)
 	}
 }
 
@@ -290,7 +658,7 @@ func TestFindSeedMaterialChaChaSeedAtFinalAlignedOffset(t *testing.T) {
 	if _, err := rand.Read(seed); err != nil {
 		t.Fatal(err)
 	}
-	split := chachaSplits[0]
+	split := chachaKeySplits[0]
 	encBlob := chacha20Decrypt(seed, split[0], split[1], key.der)
 
 	kernelPayload := make([]byte, 304)
@@ -304,6 +672,80 @@ func TestFindSeedMaterialChaChaSeedAtFinalAlignedOffset(t *testing.T) {
 	if materials[0].SeedOffset != len(kernelPayload)-seedLen {
 		t.Fatalf("seed offset = %d, want %d", materials[0].SeedOffset, len(kernelPayload)-seedLen)
 	}
+}
+
+func TestFindSeedMaterialsChaChaSplitSixThree(t *testing.T) {
+	split := [2]int{6, 3}
+
+	t.Run("contiguous", func(t *testing.T) {
+		key := genTestRSAKey(t)
+		kernel := make([]byte, 1024)
+		embedChaChaCandidate(t, kernel, 128, 160, key, split)
+
+		materials := scanChaChaFamily(context.Background(), kernel)
+		if len(materials) != 1 {
+			t.Fatalf("found %d seed materials, want 1", len(materials))
+		}
+		if materials[0].SeedOffset != 128 || materials[0].BlobOffset != 160 ||
+			materials[0].KeySplit != 6 || materials[0].IVSplit != 3 {
+			t.Fatalf("material = %+v, want seed 128, blob 160, split (6,3)", materials[0])
+		}
+
+		plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte("rootfs-cpio-data"), 50)...)
+		body := chacha20Decrypt(materials[0].Seed, split[0], split[1], plaintext)
+		if result := tryChaCha20Body(materials[0], body, nil); result != nil {
+			t.Fatalf("(6,3) RSA discovery also enabled body probing: %+v", result)
+		}
+	})
+
+	t.Run("aligned-gap", func(t *testing.T) {
+		key := genTestRSAKey(t)
+		kernel := make([]byte, 1024)
+		embedChaChaCandidate(t, kernel, 544, 256, key, split)
+
+		materials := scanChaChaFamily(context.Background(), kernel)
+		if len(materials) != 1 {
+			t.Fatalf("found %d seed materials, want 1", len(materials))
+		}
+		if materials[0].SeedOffset != 544 || materials[0].BlobOffset != 256 {
+			t.Fatalf("offsets = (%d,%d), want (544,256)", materials[0].SeedOffset, materials[0].BlobOffset)
+		}
+	})
+
+	t.Run("malformed", func(t *testing.T) {
+		key := genTestRSAKey(t)
+		kernel := make([]byte, 1024)
+		seed := embedChaChaCandidate(t, kernel, 128, 160, key, split)
+		malformed := append([]byte(nil), key.der...)
+		malformed[len(malformed)-1] ^= 0xff
+		copy(kernel[160:160+blobLen], chacha20Decrypt(seed, split[0], split[1], malformed))
+
+		if materials := scanChaChaFamily(context.Background(), kernel); len(materials) != 0 {
+			t.Fatalf("found %d seed materials, want 0", len(materials))
+		}
+	})
+
+	t.Run("zero", func(t *testing.T) {
+		if materials := scanChaChaFamily(context.Background(), make([]byte, 1024)); len(materials) != 0 {
+			t.Fatalf("found %d seed materials, want 0", len(materials))
+		}
+	})
+
+	t.Run("multiple", func(t *testing.T) {
+		first := genTestRSAKey(t)
+		second := genTestRSAKey(t)
+		kernel := make([]byte, 2048)
+		if _, err := rand.Read(kernel); err != nil {
+			t.Fatal(err)
+		}
+		embedChaChaCandidate(t, kernel, 128, 160, first, split)
+		embedChaChaCandidate(t, kernel, 1536, 1024, second, split)
+
+		materials := scanChaChaFamily(context.Background(), kernel)
+		if len(materials) != 2 {
+			t.Fatalf("found %d seed materials, want 2", len(materials))
+		}
+	})
 }
 
 func TestFindSeedMaterialsDeterministicOrder(t *testing.T) {
@@ -501,11 +943,17 @@ func TestPKCS1UnwrapRejectsMissingAndShortPadding(t *testing.T) {
 
 func TestTryAESCTRReportsMismatchedBodyHash(t *testing.T) {
 	payload := make([]byte, 80)
+	for i := range payload {
+		payload[i] = byte(i*37 + 11)
+	}
 	plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte{0x42}, 64)...)
-	body := aesCustomCTR(payload[48:80], payload[32:40], 0, counterStep(payload[32:48]), plaintext)
+	body := aesCustomCTR(payload[48:80], payload[32:40], getLE64(payload[40:48]), counterStep(payload[32:48]), plaintext)
 	bodyHash := bytes.Repeat([]byte{0x42}, sha256.Size)
-	result := tryAESCTR(payload, body, bodyHash)
-	if result == nil {
+	if _, handled := tryAESCTRKeyBeforeCounter(payload, body, bodyHash); handled {
+		t.Fatal("legacy fixture is structurally ambiguous with a strict layout")
+	}
+	result, handled := tryAESCTR(payload, body, bodyHash)
+	if result == nil || !handled {
 		t.Fatal("expected a plausible AES plaintext despite the mismatched body hash")
 	}
 	if result.HashOK {
