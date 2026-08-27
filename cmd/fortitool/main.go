@@ -29,6 +29,7 @@ type command struct {
 
 var commands = []command{
 	{"decrypt", "full pipeline: .out -> L1 decrypt -> ext3 -> rootfs decrypt -> unpack", cmdDecrypt},
+	{"inspect", "describe one firmware image read-only, including partial support", cmdInspect},
 	{"l1", "outer .out XOR layer only (known-plaintext attack)", cmdL1},
 	{"rootfs", "rootfs.gz crypto layer only, any known FortiOS era, auto-detected", cmdRootfs},
 	{"unpack", "generic archive unpack: gzip+tar or xz+tar -> directory", cmdUnpack},
@@ -146,8 +147,8 @@ Run 'fortitool <command> -h' for a full description, flags, and examples
 for that command.
 
 EXIT CODES
-  0  success
-  1  ran, but failed (e.g. no valid key found, file not found, bad input)
+  0  success (inspect also uses 0 for a readable partial/unsupported result)
+  1  ran, but failed (e.g. no valid key found or file not found)
   2  usage error (unknown command / missing required argument)
 
 For everything that's verified against real firmware vs. architecturally

@@ -75,7 +75,16 @@ func ExtractNewc(r io.Reader, destDir string) error {
 		return err
 	}
 	defer root.Close()
+	return processNewc(r, root)
+}
 
+// ValidateNewc validates the same newc structure and safety decisions as
+// ExtractNewc while discarding file bodies instead of creating output.
+func ValidateNewc(r io.Reader) error {
+	return processNewc(r, nil)
+}
+
+func processNewc(r io.Reader, root *os.Root) error {
 	paths := &cpioPathNode{}
 	groups := make(map[cpioHardLinkKey]*cpioHardLinkGroup)
 	var groupOrder []cpioHardLinkKey
@@ -120,8 +129,10 @@ func ExtractNewc(r io.Reader, destDir string) error {
 			if hdr.fileSize != 0 {
 				return fmt.Errorf("cpio directory %q has non-zero size", name)
 			}
-			if err := createCPIODirectory(root, target); err != nil {
-				return err
+			if root != nil {
+				if err := createCPIODirectory(root, target); err != nil {
+					return err
+				}
 			}
 		case cpioModeRegular:
 			if hdr.nlink == 0 {
@@ -129,7 +140,7 @@ func ExtractNewc(r io.Reader, destDir string) error {
 			}
 			mode := os.FileMode(hdr.mode)&0o777 | 0o200
 			if hdr.nlink == 1 {
-				if err := writeCPIORegular(root, r, target, mode, hdr.fileSize); err != nil {
+				if err := consumeCPIORegular(root, r, target, mode, hdr.fileSize); err != nil {
 					return err
 				}
 			} else {
@@ -151,13 +162,15 @@ func ExtractNewc(r io.Reader, destDir string) error {
 					if group.dataPath != "" {
 						return fmt.Errorf("cpio hard-link group for %q has multiple data members", name)
 					}
-					if err := writeCPIORegular(root, r, target, mode, hdr.fileSize); err != nil {
+					if err := consumeCPIORegular(root, r, target, mode, hdr.fileSize); err != nil {
 						return err
 					}
 					group.dataPath = target
 				} else {
-					if err := prepareCPIOOutput(root, target); err != nil {
-						return err
+					if root != nil {
+						if err := prepareCPIOOutput(root, target); err != nil {
+							return err
+						}
 					}
 					group.pending = append(group.pending, cpioPendingLink{path: target, mode: mode})
 				}
@@ -180,11 +193,13 @@ func ExtractNewc(r io.Reader, destDir string) error {
 			if err != nil {
 				return err
 			}
-			if err := prepareCPIOOutput(root, target); err != nil {
-				return err
-			}
-			if err := root.Symlink(linkTarget, target); err != nil {
-				return err
+			if root != nil {
+				if err := prepareCPIOOutput(root, target); err != nil {
+					return err
+				}
+				if err := root.Symlink(linkTarget, target); err != nil {
+					return err
+				}
 			}
 		case cpioModeBlock, cpioModeChar, cpioModeFIFO, cpioModeSocket:
 			if hdr.fileSize != 0 {
@@ -426,6 +441,19 @@ func writeCPIORegular(root *os.Root, r io.Reader, target string, mode os.FileMod
 	return nil
 }
 
+func consumeCPIORegular(root *os.Root, r io.Reader, target string, mode os.FileMode, size uint64) error {
+	if root != nil {
+		return writeCPIORegular(root, r, target, mode, size)
+	}
+	if size > math.MaxInt64 {
+		return fmt.Errorf("cpio file %q has unreasonable size %d", target, size)
+	}
+	if _, err := io.CopyN(io.Discard, r, int64(size)); err != nil {
+		return fmt.Errorf("cpio file %q is truncated: %w", target, err)
+	}
+	return readNewcPadding(r, size, "file data")
+}
+
 func resolveCPIOHardLinks(root *os.Root, groups map[cpioHardLinkKey]*cpioHardLinkGroup, order []cpioHardLinkKey) error {
 	for _, key := range order {
 		group := groups[key]
@@ -437,11 +465,16 @@ func resolveCPIOHardLinks(root *os.Root, groups map[cpioHardLinkKey]*cpioHardLin
 				return fmt.Errorf("cpio hard-link group inode %d has no data-bearing or complete empty target", group.key.ino)
 			}
 			first := group.pending[0]
-			if err := writeCPIORegular(root, strings.NewReader(""), first.path, first.mode, 0); err != nil {
-				return err
+			if root != nil {
+				if err := writeCPIORegular(root, strings.NewReader(""), first.path, first.mode, 0); err != nil {
+					return err
+				}
 			}
 			group.dataPath = first.path
 			group.pending = group.pending[1:]
+		}
+		if root == nil {
+			continue
 		}
 		if err := checkArchiveDir(root, filepath.Dir(group.dataPath)); err != nil {
 			return fmt.Errorf("cpio hard-link target %q: %w", group.dataPath, err)

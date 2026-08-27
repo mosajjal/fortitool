@@ -57,6 +57,11 @@ func TestCLIExitCodeContract(t *testing.T) {
 		{name: "decrypt extra argument", args: []string{"decrypt", "-o", output, missing, "extra"}, wantCode: 2, wantText: "usage: fortitool decrypt"},
 		{name: "decrypt runtime failure", args: []string{"decrypt", "-o", output, missing}, wantCode: 1, wantText: "no such file"},
 
+		{name: "inspect help", args: []string{"inspect", "-h"}, wantCode: 0, wantText: "fortitool inspect --"},
+		{name: "inspect missing argument", args: []string{"inspect"}, wantCode: 2, wantText: "usage: fortitool inspect"},
+		{name: "inspect extra argument", args: []string{"inspect", missing, "extra"}, wantCode: 2, wantText: "usage: fortitool inspect"},
+		{name: "inspect runtime failure", args: []string{"inspect", missing}, wantCode: 1, wantText: "input file does not exist"},
+
 		{name: "l1 help", args: []string{"l1", "-h"}, wantCode: 0, wantText: "fortitool l1 --"},
 		{name: "l1 missing argument", args: []string{"l1"}, wantCode: 2, wantText: "usage: fortitool l1"},
 		{name: "l1 extra argument", args: []string{"l1", missing, "extra"}, wantCode: 2, wantText: "usage: fortitool l1"},
@@ -203,10 +208,16 @@ type cliResult struct {
 }
 
 func runCLISubprocess(t *testing.T, args []string, stdin string) cliResult {
+	return runCLISubprocessAt(t, args, stdin, "", nil)
+}
+
+func runCLISubprocessAt(t *testing.T, args []string, stdin, dir string, extraEnv []string) cliResult {
 	t.Helper()
 	helperArgs := append([]string{"-test.run=^TestCLIHelperProcess$", "--"}, args...)
 	cmd := exec.Command(os.Args[0], helperArgs...)
-	cmd.Env = append(os.Environ(), cliHelperEnvironment+"=1")
+	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Env = append(cmd.Env, cliHelperEnvironment+"=1")
+	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

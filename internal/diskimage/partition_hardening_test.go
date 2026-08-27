@@ -161,6 +161,44 @@ func TestFindFilesystemsPreservesValidFallbacks(t *testing.T) {
 	}
 }
 
+func TestFindFilesystemVolumesReportsExistingDiscoveryDecision(t *testing.T) {
+	tests := []struct {
+		name      string
+		offset    int
+		partition bool
+		wantKind  string
+		wantIndex int
+	}{
+		{name: "raw", wantKind: "raw"},
+		{name: "fixed offset", offset: 0x100000, wantKind: "fixed-offset"},
+		{name: "partition", offset: sectorSize, partition: true, wantKind: "mbr-partition", wantIndex: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fsImage := fakeExt2(t)
+			disk := make([]byte, tc.offset+len(fsImage))
+			copy(disk[tc.offset:], fsImage)
+			if tc.partition {
+				disk[510] = mbrSignature0
+				disk[511] = mbrSignature1
+				entry := disk[446 : 446+16]
+				entry[4] = 0x83
+				binary.LittleEndian.PutUint32(entry[8:12], uint32(tc.offset/sectorSize))
+				binary.LittleEndian.PutUint32(entry[12:16], uint32(len(fsImage)/sectorSize))
+			}
+
+			volumes := FindFilesystemVolumes(bytes.NewReader(disk), int64(len(disk)))
+			if len(volumes) != 1 {
+				t.Fatalf("FindFilesystemVolumes returned %d volumes, want 1", len(volumes))
+			}
+			location := volumes[0].Location
+			if location.Kind != tc.wantKind || location.Offset != int64(tc.offset) || location.PartitionIndex != tc.wantIndex {
+				t.Fatalf("location = %+v, want kind=%q offset=%d partition=%d", location, tc.wantKind, tc.offset, tc.wantIndex)
+			}
+		})
+	}
+}
+
 func TestFindFilesystemsBoundsFallbackWindowsToMBRIntervals(t *testing.T) {
 	const nestedOffset = 0x100000
 	tests := []struct {

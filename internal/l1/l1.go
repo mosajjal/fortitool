@@ -9,6 +9,7 @@ package l1
 import (
 	"context"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -44,9 +45,15 @@ func validKey(key []byte) bool {
 // validateDecryption reports whether cleartext looks like a decrypted
 // firmware header: magic at [12:16] and an ASCII image name at [16:46]
 // containing "build".
-func validateDecryption(cleartext []byte) bool {
+// Header is the validated identity block selected by the L1 pipeline.
+type Header struct {
+	Identity string
+	Offset   int
+}
+
+func parseHeader(cleartext []byte) (string, bool) {
 	if len(cleartext) < 46 {
-		return false
+		return "", false
 	}
 	m := cleartext[12:16]
 	matched := false
@@ -57,7 +64,7 @@ func validateDecryption(cleartext []byte) bool {
 		}
 	}
 	if !matched {
-		return false
+		return "", false
 	}
 	name := cleartext[16:46]
 	for _, b := range name {
@@ -65,7 +72,7 @@ func validateDecryption(cleartext []byte) bool {
 			continue
 		}
 		if b < 0x20 || b > 0x7e {
-			return false
+			return "", false
 		}
 	}
 	lower := make([]byte, len(name))
@@ -75,7 +82,15 @@ func validateDecryption(cleartext []byte) bool {
 		}
 		lower[i] = b
 	}
-	return containsBuild(lower)
+	if !containsBuild(lower) {
+		return "", false
+	}
+	return strings.TrimRight(string(name), "\x00 "), true
+}
+
+func validateDecryption(cleartext []byte) bool {
+	_, ok := parseHeader(cleartext)
+	return ok
 }
 
 func containsBuild(s []byte) bool {
@@ -98,18 +113,25 @@ func containsBuild(s []byte) bool {
 	return false
 }
 
-// IsCleartext reports whether data already carries a valid, unencrypted
-// firmware header at block 0 offset 0..79 (some images ship unencrypted).
-func IsCleartext(data []byte) bool {
+// FindHeader returns the same validated firmware header used by L1
+// cleartext detection and key recovery.
+func FindHeader(data []byte) (Header, bool) {
 	for off := 0; off+headerSize <= len(data); off += BlockSize {
-		if validateDecryption(data[off : off+headerSize]) {
-			return true
+		if identity, ok := parseHeader(data[off : off+headerSize]); ok {
+			return Header{Identity: identity, Offset: off}, true
 		}
 		if off == 0 && len(data) < BlockSize {
 			break
 		}
 	}
-	return false
+	return Header{}, false
+}
+
+// IsCleartext reports whether data already carries a valid, unencrypted
+// firmware header at block 0 offset 0..79 (some images ship unencrypted).
+func IsCleartext(data []byte) bool {
+	_, ok := FindHeader(data)
+	return ok
 }
 
 // decryptBlock decrypts up to BlockSize bytes of a single 512-byte block.

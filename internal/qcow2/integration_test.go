@@ -83,15 +83,18 @@ func TestDiskimageOverQCow2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("qcow2.Open: %v", err)
 	}
-	fss := diskimage.FindFilesystems(rd, rd.Size())
-	if len(fss) == 0 {
+	volumes := diskimage.FindFilesystemVolumes(rd, rd.Size())
+	if len(volumes) == 0 {
 		t.Fatal("FindFilesystems found no ext volume inside the qcow2 disk")
 	}
-	got, err := fss[0].ReadFile("flatkc")
+	if location := volumes[0].Location; location.Kind != "mbr-partition" || location.PartitionIndex != 1 || location.Offset != 512 {
+		t.Fatalf("guest filesystem location = %+v", location)
+	}
+	got, err := volumes[0].FS.ReadFile("flatkc")
 	if err != nil || string(got) != "KERN" {
 		t.Fatalf("flatkc = %q, %v", got, err)
 	}
-	got, err = fss[0].ReadFile("rootfs.gz")
+	got, err = volumes[0].FS.ReadFile("rootfs.gz")
 	if err != nil || string(got) != "ROOTFS" {
 		t.Fatalf("rootfs.gz = %q, %v", got, err)
 	}

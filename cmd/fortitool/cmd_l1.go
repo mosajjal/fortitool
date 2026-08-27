@@ -16,14 +16,19 @@ import (
 // gunzipOuter decompresses the outer gzip wrapper every .out firmware file
 // carries, tolerating trailing garbage the way `gunzip --force` does.
 func gunzipOuter(data []byte) ([]byte, error) {
+	image, _, err := decodeOuter(data)
+	return image, err
+}
+
+func decodeOuter(data []byte) (image []byte, wasGzip bool, err error) {
 	r, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		// Not gzip at all: some callers pass an already-decompressed image.
 		// If the gzip magic is present, however, a malformed header is fatal.
 		if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
-			return data, nil
+			return data, false, nil
 		}
-		return nil, fmt.Errorf("gunzip: %w", err)
+		return nil, true, fmt.Errorf("gunzip: %w", err)
 	}
 	defer r.Close()
 	// FortiOS .out files append additional installer data after the first
@@ -32,9 +37,9 @@ func gunzipOuter(data []byte) ([]byte, error) {
 	r.Multistream(false)
 	out, err := io.ReadAll(r)
 	if err != nil {
-		return nil, fmt.Errorf("gunzip: %w", err)
+		return nil, true, fmt.Errorf("gunzip: %w", err)
 	}
-	return out, nil
+	return out, true, nil
 }
 
 func cmdL1(ctx context.Context, args []string) error {

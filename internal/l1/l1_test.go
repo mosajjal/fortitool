@@ -97,6 +97,23 @@ func TestIsCleartext(t *testing.T) {
 	}
 }
 
+func TestFindHeaderUsesValidatedL1Identity(t *testing.T) {
+	plain := make([]byte, 2*BlockSize)
+	copy(plain[BlockSize+12:BlockSize+16], []byte{0xff, 0x00, 0xaa, 0x55})
+	copy(plain[BlockSize+16:BlockSize+46], []byte("SYNTH-v0.0-FW-build0001\x00\x00\x00"))
+
+	header, ok := FindHeader(plain)
+	if !ok {
+		t.Fatal("FindHeader did not find the validated header")
+	}
+	if header.Identity != "SYNTH-v0.0-FW-build0001" {
+		t.Fatalf("identity = %q", header.Identity)
+	}
+	if header.Offset != BlockSize {
+		t.Fatalf("offset = %d, want %d", header.Offset, BlockSize)
+	}
+}
+
 func TestDecryptAutoNoKeyFound(t *testing.T) {
 	junk := bytes.Repeat([]byte{0x7a}, BlockSize*3)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

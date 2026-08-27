@@ -8,10 +8,26 @@ import (
 
 // Partition is one entry of a DOS/MBR partition table.
 type Partition struct {
+	Index       int
 	Bootable    bool
 	Type        byte
 	StartByte   int64
 	LengthBytes int64
+}
+
+// FilesystemLocation describes how FindFilesystems reached a volume without
+// changing the discovery order or validation used to select it.
+type FilesystemLocation struct {
+	Kind           string
+	Offset         int64
+	Length         int64
+	PartitionIndex int
+}
+
+// LocatedFilesystem couples a readable filesystem with its discovery result.
+type LocatedFilesystem struct {
+	FS       *FS
+	Location FilesystemLocation
 }
 
 const (
@@ -43,6 +59,7 @@ func ReadMBR(r io.ReaderAt) ([]Partition, error) {
 			continue
 		}
 		parts = append(parts, Partition{
+			Index:       i + 1,
 			Bootable:    e[0]&0x80 != 0,
 			Type:        e[4],
 			StartByte:   start,
@@ -77,12 +94,25 @@ func ProbeExt(r io.ReaderAt, off int64) bool {
 // Each candidate is validated by parsing its superblock and root inode
 // metadata; failures are skipped silently.
 func FindFilesystems(r io.ReaderAt, size int64) []*FS {
+	located := FindFilesystemVolumes(r, size)
+	out := make([]*FS, 0, len(located))
+	for _, volume := range located {
+		out = append(out, volume.FS)
+	}
+	return out
+}
+
+// FindFilesystemVolumes is FindFilesystems with the selected candidate's
+// existing discovery metadata exposed for reporting callers.
+func FindFilesystemVolumes(r io.ReaderAt, size int64) []LocatedFilesystem {
 	if size < 0 {
 		return nil
 	}
 	type candidate struct {
-		offset int64
-		length int64
+		offset         int64
+		length         int64
+		kind           string
+		partitionIndex int
 	}
 	var candidates []candidate
 	claimedPartitionOffsets := make(map[int64]struct{})
@@ -93,21 +123,27 @@ func FindFilesystems(r io.ReaderAt, size int64) []*FS {
 			if off, length, ok := partitionWindow(p, size); ok {
 				partitions = append(partitions, p)
 				claimedPartitionOffsets[off] = struct{}{}
-				candidates = append(candidates, candidate{offset: off, length: length})
+				candidates = append(candidates, candidate{
+					offset: off, length: length, kind: "mbr-partition", partitionIndex: p.Index,
+				})
 			}
 		}
 	}
 	for _, off := range []int64{0, 512, 0x400000, 0x100000, 0x200000} {
 		if _, claimed := claimedPartitionOffsets[off]; !claimed {
 			if length, ok := fallbackWindow(off, size, partitions); ok {
-				candidates = append(candidates, candidate{offset: off, length: length})
+				kind := "fixed-offset"
+				if off == 0 {
+					kind = "raw"
+				}
+				candidates = append(candidates, candidate{offset: off, length: length, kind: kind})
 			}
 		}
 	}
 	for off := int64(filesystemScanStride); off < size; {
 		if _, claimed := claimedPartitionOffsets[off]; !claimed {
 			if length, ok := fallbackWindow(off, size, partitions); ok {
-				candidates = append(candidates, candidate{offset: off, length: length})
+				candidates = append(candidates, candidate{offset: off, length: length, kind: "scanned-offset"})
 			}
 		}
 		if size-off <= filesystemScanStride {
@@ -117,7 +153,7 @@ func FindFilesystems(r io.ReaderAt, size int64) []*FS {
 	}
 
 	seen := map[int64]bool{}
-	var out []*FS
+	var out []LocatedFilesystem
 	for _, candidate := range candidates {
 		if seen[candidate.offset] {
 			continue
@@ -130,7 +166,13 @@ func FindFilesystems(r io.ReaderAt, size int64) []*FS {
 		if err != nil {
 			continue
 		}
-		out = append(out, fs)
+		out = append(out, LocatedFilesystem{
+			FS: fs,
+			Location: FilesystemLocation{
+				Kind: candidate.kind, Offset: candidate.offset, Length: candidate.length,
+				PartitionIndex: candidate.partitionIndex,
+			},
+		})
 	}
 	return out
 }

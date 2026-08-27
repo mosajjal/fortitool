@@ -22,6 +22,7 @@ or build from source (`git clone https://github.com/mosajjal/fortitool && cd for
 | Command | Does |
 |---|---|
 | `fortitool decrypt -o OUTDIR image.out` | Full pipeline: raw `.out` -> unpacked rootfs, one shot. Try this first for a firmware image. |
+| `fortitool inspect image.out` | Describe one image and its last recognised stage without extracting files or showing keys |
 | `fortitool l1 -o out.img image.out` | Outer XOR layer only |
 | `fortitool rootfs -o out.gz flatkc rootfs.gz` | rootfs.gz crypto layer only |
 | `fortitool unpack -o outdir archive` | Generic tar / gzip+tar / xz+tar extraction |
@@ -41,6 +42,10 @@ parser doesn't permute argv).
 
 ## Notes
 
+- `inspect` is read-only and single-image. A readable partial or unsupported
+  image exits 0 with `status: partial`, `last-successful-stage` and
+  `unsupported-stage`; absent or inaccessible input exits 1. It has no
+  `--show-keys`, output-directory, JSON or batch option.
 - `decrypt` discovers supported ext filesystems in raw MBR-partitioned,
   qcow2, and fixed-offset disk layouts. Its output directory must not already
   exist and is published only after the complete pipeline succeeds.
