@@ -95,10 +95,8 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 
 	bodyHash := sha256.Sum256(body)
 
-	if r, handled := tryAESCTR(payload, body, bodyHash[:]); handled {
-		if r != nil {
-			r.Seed = sm
-		}
+	if r := tryAESCTR(payload, body, bodyHash[:]); r != nil {
+		r.Seed = sm
 		return r, true
 	}
 	if r := tryChaCha20Body(sm, body, bodyHash[:]); r != nil {
@@ -149,14 +147,11 @@ func tryChaCha20Body(sm *SeedMaterial, body, bodyHash []byte) *Result {
 	return nil
 }
 
-func tryAESCTR(payload, body, bodyHash []byte) (*Result, bool) {
+func tryAESCTR(payload, body, bodyHash []byte) *Result {
 	if r, handled := tryAESCTRKeyBeforeCounter(payload, body, bodyHash); handled {
-		return r, true
+		return r
 	}
-	if r := tryAESCTRLegacy(payload, body, bodyHash); r != nil {
-		return r, true
-	}
-	return nil, false
+	return tryAESCTRLegacy(payload, body, bodyHash)
 }
 
 // Some 80-byte payloads place the 32-byte key immediately before the
