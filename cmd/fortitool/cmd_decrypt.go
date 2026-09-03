@@ -381,17 +381,19 @@ func diskLayoutForLocation(containerLayout string, location diskimage.Filesystem
 // shapes exist across the product line:
 //
 //   - gzip-compressed GNU tar or newc CPIO: classified from the decompressed
-//     stream and extracted directly;
+//     stream and extracted directly. Skips classifyRootfsPayload, which would
+//     inflate the whole archive once more just to learn the container kind;
 //   - xz-compressed ext4 filesystem image (8.0 VM builds): decompressed,
 //     then dumped file-by-file through the pure-Go ext reader.
 func extractRootfsPayload(plain []byte, destDir string) error {
+	if len(plain) >= 2 && plain[0] == 0x1f && plain[1] == 0x8b {
+		return archive.ExtractGzipRootfs(plain, destDir)
+	}
 	decision, err := classifyRootfsPayload(plain)
 	if err != nil {
 		return err
 	}
 	switch decision.Kind {
-	case "gzip/tar", "gzip/newc":
-		return archive.ExtractGzipRootfs(plain, destDir)
 	case "xz/ext":
 		return decision.ext.ExtractAll(destDir)
 	default:

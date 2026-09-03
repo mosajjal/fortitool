@@ -42,15 +42,15 @@ func validKey(key []byte) bool {
 	return true
 }
 
-// validateDecryption reports whether cleartext looks like a decrypted
-// firmware header: magic at [12:16] and an ASCII image name at [16:46]
-// containing "build".
 // Header is the validated identity block selected by the L1 pipeline.
 type Header struct {
 	Identity string
 	Offset   int
 }
 
+// parseHeader reports whether cleartext looks like a decrypted firmware
+// header: magic at [12:16] and an ASCII image name at [16:46] containing
+// "build".
 func parseHeader(cleartext []byte) (string, bool) {
 	if len(cleartext) < 46 {
 		return "", false

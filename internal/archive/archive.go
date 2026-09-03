@@ -66,10 +66,6 @@ func ExtractGzipTar(data []byte, destDir string) error {
 // ExtractGzipRootfs extracts gzip-wrapped tar and newc CPIO rootfs
 // containers without relying on filenames, models, or versions.
 func ExtractGzipRootfs(data []byte, destDir string) error {
-	format, err := ClassifyGzipRootfs(data)
-	if err != nil {
-		return err
-	}
 	compressed := bytes.NewReader(data)
 	gz, err := gzip.NewReader(compressed)
 	if err != nil {
@@ -79,6 +75,10 @@ func ExtractGzipRootfs(data []byte, destDir string) error {
 	gz.Multistream(false)
 
 	br := bufio.NewReader(gz)
+	format, err := peekGzipRootfsFormat(br)
+	if err != nil {
+		return err
+	}
 	switch format {
 	case GzipRootfsNewc:
 		err = ExtractNewc(br, destDir)
@@ -112,14 +112,12 @@ func ClassifyGzipRootfs(data []byte) (GzipRootfsFormat, error) {
 	gz.Multistream(false)
 
 	br := bufio.NewReader(gz)
-	magic, err := br.Peek(len(newcMagic))
+	format, err := peekGzipRootfsFormat(br)
 	if err != nil {
 		_ = gz.Close()
-		return "", fmt.Errorf("gzip payload: %w", err)
+		return "", err
 	}
-	format := GzipRootfsTar
-	if bytes.Equal(magic, []byte(newcMagic)) || bytes.Equal(magic, []byte(newcCRCMagic)) {
-		format = GzipRootfsNewc
+	if format == GzipRootfsNewc {
 		err = ValidateNewc(br)
 	} else {
 		err = validateTarStructure(br)
@@ -143,6 +141,17 @@ func ClassifyGzipRootfs(data []byte) (GzipRootfsFormat, error) {
 		}
 	}
 	return format, nil
+}
+
+func peekGzipRootfsFormat(br *bufio.Reader) (GzipRootfsFormat, error) {
+	magic, err := br.Peek(len(newcMagic))
+	if err != nil {
+		return "", fmt.Errorf("gzip payload: %w", err)
+	}
+	if bytes.Equal(magic, []byte(newcMagic)) || bytes.Equal(magic, []byte(newcCRCMagic)) {
+		return GzipRootfsNewc, nil
+	}
+	return GzipRootfsTar, nil
 }
 
 func validateTarStructure(r io.Reader) error {
