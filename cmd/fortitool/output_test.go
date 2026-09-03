@@ -92,19 +92,28 @@ func syntheticNewcRootfsWithTail(t *testing.T, trailer bool, tail []byte) []byte
 }
 
 func syntheticDecryptImage(t *testing.T, rootfs []byte) []byte {
+	return syntheticDecryptImageWithMembers(t, []byte("synthetic flatkc"), rootfs)
+}
+
+func syntheticDecryptImageWithMembers(t *testing.T, flatkc, rootfs []byte) []byte {
 	t.Helper()
 	const (
 		blockSize       = 1024
-		totalBlocks     = 10
 		inodesPerGroup  = 16
 		inodeTableBlock = 3
 		inodeBitmap     = 5
 		rootDirBlock    = 6
 		flatkcBlock     = 7
-		rootfsBlock     = 8
 	)
-	if len(rootfs) > blockSize {
-		t.Fatalf("synthetic rootfs is %d bytes", len(rootfs))
+	flatkcBlocks := (len(flatkc) + blockSize - 1) / blockSize
+	rootfsBlocks := (len(rootfs) + blockSize - 1) / blockSize
+	if flatkcBlocks > 12 || rootfsBlocks > 12 {
+		t.Fatalf("synthetic members need %d/%d direct blocks", flatkcBlocks, rootfsBlocks)
+	}
+	rootfsBlock := flatkcBlock + flatkcBlocks
+	totalBlocks := max(10, rootfsBlock+rootfsBlocks)
+	if totalBlocks > inodesPerGroup {
+		t.Fatalf("synthetic image needs %d blocks", totalBlocks)
 	}
 	image := make([]byte, totalBlocks*blockSize)
 	block := func(number int) []byte {
@@ -118,10 +127,10 @@ func syntheticDecryptImage(t *testing.T, rootfs []byte) []byte {
 
 	superblock := block(1)
 	le32(superblock[0:4], inodesPerGroup)
-	le32(superblock[4:8], totalBlocks)
+	le32(superblock[4:8], uint32(totalBlocks))
 	le32(superblock[20:24], 1)
 	le32(superblock[24:28], 0)
-	le32(superblock[32:36], totalBlocks-1)
+	le32(superblock[32:36], uint32(totalBlocks-1))
 	le32(superblock[40:44], inodesPerGroup)
 	le16(superblock[56:58], 0xef53)
 	le32(superblock[76:80], 1)
@@ -133,17 +142,18 @@ func syntheticDecryptImage(t *testing.T, rootfs []byte) []byte {
 	le32(descriptor[8:12], inodeTableBlock)
 	block(inodeBitmap)[0] = 0x0f
 
-	writeInode := func(number uint32, mode uint16, size uint32, dataBlock uint32) {
+	writeInode := func(number uint32, mode uint16, size uint32, dataBlock, blocks uint32) {
 		offset := inodeTableBlock*blockSize + int(number-1)*128
 		inode := image[offset : offset+128]
 		le16(inode[0:2], mode)
 		le32(inode[4:8], size)
-		le32(inode[40:44], dataBlock)
+		for i := uint32(0); i < blocks; i++ {
+			le32(inode[40+i*4:44+i*4], dataBlock+i)
+		}
 	}
-	flatkc := []byte("synthetic flatkc")
-	writeInode(2, 0o040755, blockSize, rootDirBlock)
-	writeInode(3, 0o100644, uint32(len(flatkc)), flatkcBlock)
-	writeInode(4, 0o100644, uint32(len(rootfs)), rootfsBlock)
+	writeInode(2, 0o040755, blockSize, rootDirBlock, 1)
+	writeInode(3, 0o100644, uint32(len(flatkc)), flatkcBlock, uint32(flatkcBlocks))
+	writeInode(4, 0o100644, uint32(len(rootfs)), uint32(rootfsBlock), uint32(rootfsBlocks))
 
 	type directoryEntry struct {
 		inode    uint32
@@ -170,8 +180,8 @@ func syntheticDecryptImage(t *testing.T, rootfs []byte) []byte {
 		copy(directory[offset+8:offset+8+len(entry.name)], entry.name)
 		offset += recordLength
 	}
-	copy(block(flatkcBlock), flatkc)
-	copy(block(rootfsBlock), rootfs)
+	copy(image[flatkcBlock*blockSize:], flatkc)
+	copy(image[rootfsBlock*blockSize:], rootfs)
 	return gzipBytes(t, image)
 }
 

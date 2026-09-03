@@ -150,6 +150,56 @@ func TestExtractGzipRootfsTar(t *testing.T) {
 	}
 }
 
+func TestClassifyGzipRootfsMatchesExtractionDispatch(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want GzipRootfsFormat
+	}{
+		{
+			name: "newc",
+			data: gzipTestData(t, buildNewc(t, []newcTestEntry{{name: "init", mode: cpioModeRegular | 0o755}}, true)),
+			want: GzipRootfsNewc,
+		},
+		{
+			name: "tar",
+			data: gzipTestData(t, buildTar(t, []testFile{{name: "init", body: "synthetic"}})),
+			want: GzipRootfsTar,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ClassifyGzipRootfs(tc.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("format = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyGzipRootfsRejectsUnsupportedOrInvalidInnerContainer(t *testing.T) {
+	crc := buildNewc(t, nil, true)
+	copy(crc[:len(newcCRCMagic)], newcCRCMagic)
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "unsupported CRC newc", data: gzipTestData(t, crc), want: newcCRCMagic},
+		{name: "invalid tar", data: gzipTestData(t, []byte("not a tar archive")), want: "tar"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ClassifyGzipRootfs(tc.data); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("classification error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestExtractGzipRootfsValidatesNewcMember(t *testing.T) {
 	plain := buildNewc(t, []newcTestEntry{{name: "init", mode: cpioModeRegular | 0o755, data: []byte("synthetic")}}, true)
 	compressed := gzipTestData(t, plain)

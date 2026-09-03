@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mosajjal/fortitool/internal/archive"
 	"github.com/mosajjal/fortitool/internal/diskimage"
@@ -109,37 +110,23 @@ EXIT CODES
 	}
 
 	fmt.Println("[3/6] locating the FORTIOS volume")
-	volume, layout, err := openVolume(plain)
+	selection, err := openVolume(plain)
 	if err != nil {
 		return fmt.Errorf("volume discovery: %w", err)
 	}
-	fmt.Printf("      layout: %s\n", terminalText(layout))
-
-	extract := func(name string) ([]byte, error) {
-		data, err := volume.ReadFile(name)
-		if errors.Is(err, diskimage.ErrNotFound) {
-			return nil, nil // absent -- not every image carries every optional file
-		}
-		return data, err
+	fmt.Printf("      layout: %s\n", terminalText(selection.description))
+	if err := selection.RequiredMembers.Err(); err != nil {
+		return err
 	}
-
-	flatkc, err := extract("flatkc")
-	if err != nil {
-		return fmt.Errorf("reading flatkc: %w", err)
-	}
-	rootfsGz, err := extract("rootfs.gz")
-	if err != nil {
-		return fmt.Errorf("reading rootfs.gz: %w", err)
-	}
-	if flatkc == nil || rootfsGz == nil {
-		return fmt.Errorf("flatkc or rootfs.gz not found in the located volume")
-	}
+	volume := selection.Volume
+	flatkc := selection.RequiredMembers.Flatkc.Data
+	rootfsGz := selection.RequiredMembers.RootfsGz.Data
 	if err := os.WriteFile(filepath.Join(staged.temp, "flatkc"), flatkc, 0o644); err != nil {
 		return err
 	}
 
 	for _, extra := range []string{"datafs.tar.gz", "devicetree.dtb", "filechecksum", "hash_bin.sha256", "split_rootfs.tar.xz", ".db"} {
-		data, err := extract(extra)
+		data, err := readOptionalMember(volume, extra)
 		if err != nil {
 			return fmt.Errorf("reading %s: %w", extra, err)
 		}
@@ -256,38 +243,138 @@ func extractDatafs(outputDir string) (bool, error) {
 //
 // When several candidate volumes exist (partitioned VM disks), the one
 // actually containing flatkc + rootfs.gz wins.
-func openVolume(img []byte) (*diskimage.FS, string, error) {
+type volumeSelection struct {
+	Volume          *diskimage.FS
+	DiskLayout      string
+	Location        diskimage.FilesystemLocation
+	RequiredMembers requiredMembersDecision
+	description     string
+}
+
+type volumeFileReader interface {
+	ReadFile(string) ([]byte, error)
+}
+
+type memberDecision struct {
+	Name string
+	Data []byte
+	Err  error
+}
+
+type requiredMembersDecision struct {
+	Flatkc   memberDecision
+	RootfsGz memberDecision
+}
+
+func readRequiredMembers(volume volumeFileReader) requiredMembersDecision {
+	return requiredMembersDecision{
+		Flatkc:   readMember(volume, "flatkc"),
+		RootfsGz: readMember(volume, "rootfs.gz"),
+	}
+}
+
+func readMember(volume volumeFileReader, name string) memberDecision {
+	data, err := volume.ReadFile(name)
+	return memberDecision{Name: name, Data: data, Err: err}
+}
+
+func (d requiredMembersDecision) Err() error {
+	var missing []string
+	for _, member := range []memberDecision{d.Flatkc, d.RootfsGz} {
+		switch {
+		case member.Err == nil:
+		case errors.Is(member.Err, diskimage.ErrNotFound):
+			missing = append(missing, member.Name)
+		default:
+			return fmt.Errorf("reading required member %s: %w", member.Name, member.Err)
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("required member absent: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func (m memberDecision) reportValue() string {
+	switch {
+	case m.Err == nil:
+		return fmt.Sprintf("present (%d bytes)", len(m.Data))
+	case errors.Is(m.Err, diskimage.ErrNotFound):
+		return "absent"
+	default:
+		return "unreadable"
+	}
+}
+
+func readOptionalMember(volume volumeFileReader, name string) ([]byte, error) {
+	member := readMember(volume, name)
+	if errors.Is(member.Err, diskimage.ErrNotFound) {
+		return nil, nil
+	}
+	return member.Data, member.Err
+}
+
+func openVolume(img []byte) (*volumeSelection, error) {
+	return locateVolume(img)
+}
+
+func locateVolume(img []byte) (*volumeSelection, error) {
 	var (
-		fss    []*diskimage.FS
-		layout string
+		volumes     []diskimage.LocatedFilesystem
+		diskLayout  string
+		description string
 	)
 	switch {
 	case qcow2.IsQCow2(img):
 		rd, err := qcow2.Open(bytes.NewReader(img))
 		if err != nil {
-			return nil, "", fmt.Errorf("qcow2: %w", err)
+			return nil, fmt.Errorf("qcow2: %w", err)
 		}
-		fss = diskimage.FindFilesystems(rd, rd.Size())
-		layout = fmt.Sprintf("qcow2 VM disk (%d MB virtual)", rd.Size()>>20)
+		volumes = diskimage.FindFilesystemVolumes(rd, rd.Size())
+		diskLayout = "qcow2"
+		description = fmt.Sprintf("qcow2 VM disk (%d MB virtual)", rd.Size()>>20)
 	default:
-		fss = diskimage.FindFilesystems(bytes.NewReader(img), int64(len(img)))
-		layout = "raw disk"
+		volumes = diskimage.FindFilesystemVolumes(bytes.NewReader(img), int64(len(img)))
+		description = "raw disk"
 	}
-	if len(fss) == 0 {
-		return nil, "", fmt.Errorf("no ext2/3/4 filesystem found in the decrypted image (tried MBR partitions, offset 512, and common fixed offsets)")
+	if len(volumes) == 0 {
+		return nil, fmt.Errorf("no ext2/3/4 filesystem found in the decrypted image (tried MBR partitions, offset 512, and common fixed offsets)")
 	}
-	for _, vol := range fss {
-		if _, err := vol.ReadFile("flatkc"); err != nil {
-			continue
+	selectVolume := func(located diskimage.LocatedFilesystem) *volumeSelection {
+		return &volumeSelection{
+			Volume: located.FS, DiskLayout: diskLayoutForLocation(diskLayout, located.Location),
+			Location: located.Location, RequiredMembers: readRequiredMembers(located.FS), description: description,
 		}
-		if _, err := vol.ReadFile("rootfs.gz"); err != nil {
-			continue
+	}
+	var first *volumeSelection
+	for _, located := range volumes {
+		selection := selectVolume(located)
+		if first == nil {
+			first = selection
 		}
-		return vol, layout, nil
+		if selection.RequiredMembers.Err() == nil {
+			return selection, nil
+		}
 	}
 	// no volume has both files; hand back the first so the caller can
 	// produce a precise error about what IS there
-	return fss[0], layout, nil
+	return first, nil
+}
+
+func diskLayoutForLocation(containerLayout string, location diskimage.FilesystemLocation) string {
+	if containerLayout != "" {
+		return containerLayout
+	}
+	switch location.Kind {
+	case "mbr-partition":
+		return "partitioned"
+	case "raw":
+		return "raw"
+	case "fixed-offset", "scanned-offset":
+		return location.Kind
+	default:
+		return "unknown"
+	}
 }
 
 // extractRootfsPayload unpacks a decrypted rootfs body. Two container
@@ -298,24 +385,48 @@ func openVolume(img []byte) (*diskimage.FS, string, error) {
 //   - xz-compressed ext4 filesystem image (8.0 VM builds): decompressed,
 //     then dumped file-by-file through the pure-Go ext reader.
 func extractRootfsPayload(plain []byte, destDir string) error {
+	decision, err := classifyRootfsPayload(plain)
+	if err != nil {
+		return err
+	}
+	switch decision.Kind {
+	case "gzip/tar", "gzip/newc":
+		return archive.ExtractGzipRootfs(plain, destDir)
+	case "xz/ext":
+		return decision.ext.ExtractAll(destDir)
+	default:
+		return fmt.Errorf("unsupported rootfs payload kind %q", decision.Kind)
+	}
+}
+
+type rootfsPayloadDecision struct {
+	Kind string
+	ext  *diskimage.FS
+}
+
+func classifyRootfsPayload(plain []byte) (*rootfsPayloadDecision, error) {
 	switch {
 	case len(plain) >= 2 && plain[0] == 0x1f && plain[1] == 0x8b:
-		return archive.ExtractGzipRootfs(plain, destDir)
+		format, err := archive.ClassifyGzipRootfs(plain)
+		if err != nil {
+			return nil, err
+		}
+		return &rootfsPayloadDecision{Kind: "gzip/" + string(format)}, nil
 	case len(plain) >= 6 && bytes.Equal(plain[:6], []byte("\xfd7zXZ\x00")):
 		raw, err := archive.XZDecompress(plain)
 		if err != nil {
-			return fmt.Errorf("xz decompress: %w", err)
+			return nil, fmt.Errorf("xz decompress: %w", err)
 		}
 		vol, err := diskimage.Open(raw)
 		if err != nil {
-			return fmt.Errorf("decompressed payload is not an ext filesystem: %w", err)
+			return nil, fmt.Errorf("decompressed payload is not an ext filesystem: %w", err)
 		}
-		return vol.ExtractAll(destDir)
+		return &rootfsPayloadDecision{Kind: "xz/ext", ext: vol}, nil
 	default:
 		prefix := plain
 		if len(prefix) > 6 {
 			prefix = prefix[:6]
 		}
-		return fmt.Errorf("decrypted rootfs is neither gzip nor xz (starts %x)", prefix)
+		return nil, fmt.Errorf("decrypted rootfs is neither gzip nor xz (starts %x)", prefix)
 	}
 }

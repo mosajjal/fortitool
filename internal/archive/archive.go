@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,13 @@ import (
 	"strings"
 
 	"github.com/ulikunitz/xz"
+)
+
+type GzipRootfsFormat string
+
+const (
+	GzipRootfsTar  GzipRootfsFormat = "tar"
+	GzipRootfsNewc GzipRootfsFormat = "newc"
 )
 
 // ExtractGzipTar decompresses gzip-compressed tar data and writes it under
@@ -58,6 +66,10 @@ func ExtractGzipTar(data []byte, destDir string) error {
 // ExtractGzipRootfs extracts gzip-wrapped tar and newc CPIO rootfs
 // containers without relying on filenames, models, or versions.
 func ExtractGzipRootfs(data []byte, destDir string) error {
+	format, err := ClassifyGzipRootfs(data)
+	if err != nil {
+		return err
+	}
 	compressed := bytes.NewReader(data)
 	gz, err := gzip.NewReader(compressed)
 	if err != nil {
@@ -67,14 +79,10 @@ func ExtractGzipRootfs(data []byte, destDir string) error {
 	gz.Multistream(false)
 
 	br := bufio.NewReader(gz)
-	magic, err := br.Peek(len(newcMagic))
-	if err != nil {
-		return fmt.Errorf("gzip payload: %w", err)
-	}
-	switch {
-	case bytes.Equal(magic, []byte(newcMagic)), bytes.Equal(magic, []byte(newcCRCMagic)):
+	switch format {
+	case GzipRootfsNewc:
 		err = ExtractNewc(br, destDir)
-	default:
+	case GzipRootfsTar:
 		err = Untar(br, destDir)
 	}
 	if err != nil {
@@ -91,6 +99,83 @@ func ExtractGzipRootfs(data []byte, destDir string) error {
 		}
 	}
 	return nil
+}
+
+// ClassifyGzipRootfs exposes the same inner-container decision used by
+// ExtractGzipRootfs without extracting any files.
+func ClassifyGzipRootfs(data []byte) (GzipRootfsFormat, error) {
+	compressed := bytes.NewReader(data)
+	gz, err := gzip.NewReader(compressed)
+	if err != nil {
+		return "", fmt.Errorf("gzip: %w", err)
+	}
+	gz.Multistream(false)
+
+	br := bufio.NewReader(gz)
+	magic, err := br.Peek(len(newcMagic))
+	if err != nil {
+		_ = gz.Close()
+		return "", fmt.Errorf("gzip payload: %w", err)
+	}
+	format := GzipRootfsTar
+	if bytes.Equal(magic, []byte(newcMagic)) || bytes.Equal(magic, []byte(newcCRCMagic)) {
+		format = GzipRootfsNewc
+		err = ValidateNewc(br)
+	} else {
+		err = validateTarStructure(br)
+	}
+	if err != nil {
+		_ = gz.Close()
+		return "", err
+	}
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		_ = gz.Close()
+		return "", fmt.Errorf("gzip: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return "", fmt.Errorf("gzip: %w", err)
+	}
+	if compressed.Len() > 0 {
+		tail := data[len(data)-compressed.Len():]
+		if next, err := gzip.NewReader(bytes.NewReader(tail)); err == nil {
+			_ = next.Close()
+			return "", fmt.Errorf("gzip: multiple members are unsupported")
+		}
+	}
+	return format, nil
+}
+
+func validateTarStructure(r io.Reader) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("tar: %w", err)
+		}
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
+		target, err := safeArchivePath("tar", hdr.Name)
+		if err != nil {
+			return err
+		}
+		switch hdr.Typeflag {
+		case tar.TypeSymlink:
+			if _, err := safeSymlinkTarget("tar", target, hdr.Linkname); err != nil {
+				return err
+			}
+		case tar.TypeLink:
+			if _, err := safeArchivePath("tar", hdr.Linkname); err != nil {
+				return err
+			}
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			return fmt.Errorf("tar: %w", err)
+		}
+	}
 }
 
 // ExtractXZTar decompresses xz-compressed tar data (bin.tar.xz, usr.tar.xz,

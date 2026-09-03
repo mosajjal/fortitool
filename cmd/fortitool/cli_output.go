@@ -42,6 +42,18 @@ func terminalText(value string) string {
 	return out.String()
 }
 
+func terminalTextLimit(value string, maxBytes int) string {
+	safe := terminalText(value)
+	if maxBytes < 4 || len(safe) <= maxBytes {
+		return safe
+	}
+	cut := maxBytes - 3
+	for cut > 0 && !utf8.ValidString(safe[:cut]) {
+		cut--
+	}
+	return safe[:cut] + "..."
+}
+
 func quoteCommandArgument(value string) string {
 	safe := terminalText(value)
 	return "'" + strings.ReplaceAll(safe, "'", "'\"'\"'") + "'"

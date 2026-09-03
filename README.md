@@ -36,6 +36,7 @@ resolver. Verify with `file fortitool` (should say "statically linked") or
 
 ```sh
 fortitool decrypt -o outdir image.out          # full pipeline, one command
+fortitool inspect image.out                    # read-only format/support report
 fortitool l1 -o out.img image.out              # outer XOR layer only
 fortitool rootfs -o out.gz flatkc rootfs.gz    # rootfs crypto layer only
 fortitool unpack -o outdir archive.tar.xz      # generic gzip+tar / xz+tar
@@ -49,6 +50,15 @@ Every command has a full description, flags, and examples via
 `fortitool <command> -h` (or run `fortitool -h` for the command list).
 Flags must precede positional arguments — Go's `flag` package doesn't
 permute argv the way getopt does.
+
+`inspect` reports one image as stable, human-readable `field: value` lines.
+It uses the same L1, disk-layout, required-member, rootfs-crypto and payload
+classification decisions as `decrypt`, but does not extract or write anything
+and never displays recovered key material. A readable image that is only
+partially recognised reports `status: partial`, a `last-successful-stage` and
+an `unsupported-stage`, and exits 0 because describing that boundary is a
+successful inspection. An absent or inaccessible input exits 1; invalid flags
+or argument count exit 2.
 
 `decrypt` and `unpack` publish a completed tree only when the requested
 output directory does not already exist. Linux uses an atomic no-replace

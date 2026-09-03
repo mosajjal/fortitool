@@ -16,6 +16,18 @@ import (
 
 const maxStandaloneRootfsExpandedSize int64 = 4 << 30
 
+type rootfsDecision struct {
+	Plaintext           []byte
+	Family              string
+	Cipher              string
+	HashOK              bool
+	AlreadyPlain        bool
+	KernelPayloadSize   int
+	KernelPayloadOffset int
+	SeedOffset          int
+	keyDetail           string
+}
+
 func cmdRootfs(ctx context.Context, args []string) error {
 	fs := newCommandFlagSet("rootfs", nil)
 	out := fs.String("o", "rootfs.gz.dec", "output file")
@@ -99,33 +111,55 @@ EXIT CODES
 // decryptRootfsAuto handles both encrypted (7.4.x+) and plain (<=7.4.0)
 // rootfs.gz: plain images are already valid gzip and need no crypto at all.
 func decryptRootfsAuto(ctx context.Context, flatkc, rootfsGz []byte, showKeys bool) ([]byte, error) {
+	decision, err := decideRootfsCrypto(ctx, flatkc, rootfsGz)
+	if err != nil {
+		return nil, err
+	}
+	if decision.AlreadyPlain {
+		fmt.Println("[+] rootfs.gz is already plain gzip (pre-7.4.1 image, no rootfs crypto)")
+		return decision.Plaintext, nil
+	}
+	fmt.Printf("[*] kernel payload: %d bytes @ flatkc offset 0x%x\n", decision.KernelPayloadSize, decision.KernelPayloadOffset)
+	fmt.Printf("[+] seed family=%s cipher=%s hashOK=%v @ kernel offset 0x%x\n",
+		terminalText(decision.Family), terminalText(decision.Cipher), decision.HashOK, decision.SeedOffset)
+	fmt.Printf("    %s\n", formatRootfsKeyDetail(decision.keyDetail, showKeys))
+	return decision.Plaintext, nil
+}
+
+func decideRootfsCrypto(ctx context.Context, flatkc, rootfsGz []byte) (*rootfsDecision, error) {
 	if len(rootfsGz) >= 2 && rootfsGz[0] == 0x1f && rootfsGz[1] == 0x8b {
 		if err := validateGzipMember(rootfsGz, maxStandaloneRootfsExpandedSize); err != nil {
 			return nil, fmt.Errorf("validating plain rootfs gzip: %w", err)
 		}
-		fmt.Println("[+] rootfs.gz is already plain gzip (pre-7.4.1 image, no rootfs crypto)")
-		return rootfsGz, nil
+		return &rootfsDecision{
+			Plaintext: rootfsGz, Family: "none", Cipher: "none", AlreadyPlain: true,
+		}, nil
 	}
 
 	payload, off, err := kernelpayload.Extract(flatkc)
 	if err != nil {
 		return nil, fmt.Errorf("extracting kernel payload from flatkc: %w", err)
 	}
-	fmt.Printf("[*] kernel payload: %d bytes @ flatkc offset 0x%x\n", len(payload), off)
-
 	res, err := rootfscrypto.DecryptRootfs(ctx, payload, rootfsGz)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("[+] seed family=%s cipher=%s hashOK=%v @ kernel offset 0x%x\n",
-		terminalText(res.Seed.Family), terminalText(res.Cipher), res.HashOK, res.Seed.SeedOffset)
-	fmt.Printf("    %s\n", formatRootfsKeyDetail(res.KeyDetail, showKeys))
 	if len(res.Plaintext) >= 2 && res.Plaintext[0] == 0x1f && res.Plaintext[1] == 0x8b {
 		if err := validateGzipMember(res.Plaintext, maxStandaloneRootfsExpandedSize); err != nil {
 			return nil, fmt.Errorf("validating decrypted rootfs gzip: %w", err)
 		}
 	}
-	return res.Plaintext, nil
+	family := "unknown"
+	seedOffset := -1
+	if res.Seed != nil {
+		family = res.Seed.Family
+		seedOffset = res.Seed.SeedOffset
+	}
+	return &rootfsDecision{
+		Plaintext: res.Plaintext, Family: family, Cipher: res.Cipher, HashOK: res.HashOK,
+		KernelPayloadSize: len(payload), KernelPayloadOffset: off, SeedOffset: seedOffset,
+		keyDetail: res.KeyDetail,
+	}, nil
 }
 
 func validateGzipMember(data []byte, maxExpanded int64) error {
