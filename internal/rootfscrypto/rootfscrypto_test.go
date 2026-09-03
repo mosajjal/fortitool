@@ -10,6 +10,8 @@ import (
 	"crypto/sha256"
 	"encoding/asn1"
 	"errors"
+	"fmt"
+	"io"
 	"math/big"
 	"strings"
 	"testing"
@@ -26,6 +28,24 @@ import (
 type testRSAKey struct {
 	priv *rsa.PrivateKey
 	der  []byte // 270-byte PKCS#1 RSAPublicKey DER
+}
+
+type cancelAfterReader struct {
+	r         io.Reader
+	remaining int
+	cancel    context.CancelFunc
+}
+
+func (r *cancelAfterReader) Read(p []byte) (int, error) {
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= n
+	if r.remaining == 0 {
+		r.cancel()
+	}
+	return n, err
 }
 
 func genTestRSAKey(t *testing.T) testRSAKey {
@@ -117,6 +137,37 @@ func buildModifiedRC4Rootfs(t *testing.T, key testRSAKey) ([]byte, []byte) {
 func buildGzipTar(t *testing.T) []byte {
 	t.Helper()
 	return gzipBytes(t, buildTar(t))
+}
+
+func buildGzipNewc(t *testing.T) []byte {
+	t.Helper()
+	return gzipBytes(t, buildNewc(t))
+}
+
+func buildNewc(t *testing.T) []byte {
+	t.Helper()
+	var archive bytes.Buffer
+	writeNewcRecord(t, &archive, "bin/init", 0o100755, []byte("synthetic-init"))
+	writeNewcRecord(t, &archive, "TRAILER!!!", 0, nil)
+	return archive.Bytes()
+}
+
+func writeNewcRecord(t *testing.T, dst *bytes.Buffer, name string, mode uint32, data []byte) {
+	t.Helper()
+	nameSize := len(name) + 1
+	if _, err := fmt.Fprintf(dst, "070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
+		1, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, nameSize, 0); err != nil {
+		t.Fatal(err)
+	}
+	dst.WriteString(name)
+	dst.WriteByte(0)
+	for dst.Len()%4 != 0 {
+		dst.WriteByte(0)
+	}
+	dst.Write(data)
+	for dst.Len()%4 != 0 {
+		dst.WriteByte(0)
+	}
 }
 
 func buildTar(t *testing.T) []byte {
@@ -397,10 +448,10 @@ func TestTryAESCTRKeyBeforeCounterRejectsInexactPayloadAndMagicOnly(t *testing.T
 	body := aesCustomCTR(aesKey, counter[:8], getLE64(counter[8:16]), counterStep(counter), plaintext)
 	hash := sha256.Sum256(body)
 	payload := append(append(append([]byte{}, hash[:]...), aesKey...), counter...)
-	if result, handled := tryAESCTRKeyBeforeCounter(payload, body, hash[:]); result != nil || !handled {
+	if result, handled := tryAESCTRKeyBeforeCounter(context.Background(), payload, body, hash[:]); result != nil || !handled {
 		t.Fatalf("magic-only result=%v handled=%v, want nil/true", result, handled)
 	}
-	if result, handled := tryAESCTRKeyBeforeCounter(append(payload, 0), body, hash[:]); result != nil || !handled {
+	if result, handled := tryAESCTRKeyBeforeCounter(context.Background(), append(payload, 0), body, hash[:]); result != nil || !handled {
 		t.Fatalf("inexact payload result=%v handled=%v, want nil/true", result, handled)
 	}
 }
@@ -470,10 +521,10 @@ func TestDecryptRootfsFallsBackToStreamCipherAfterStrictAESRejection(t *testing.
 	if !plausibleBody(strictPlain) || validCompleteGzipTar(strictPlain) {
 		t.Fatal("fixture does not produce a plausible but invalid strict AES body")
 	}
-	if result, handled := tryAESCTRKeyBeforeCounter(payload, body, digest[:]); result != nil || !handled {
+	if result, handled := tryAESCTRKeyBeforeCounter(context.Background(), payload, body, digest[:]); result != nil || !handled {
 		t.Fatalf("strict AES result=%v handled=%v, want nil/true", result, handled)
 	}
-	if result := tryAESCTR(payload, body, digest[:]); result != nil {
+	if result := tryAESCTR(context.Background(), payload, body, digest[:]); result != nil {
 		t.Fatalf("strict AES rejection fell through to legacy AES: %+v", result)
 	}
 	if result := tryChaCha20Body(&SeedMaterial{Seed: seed}, body, digest[:]); result != nil {
@@ -492,6 +543,93 @@ func TestDecryptRootfsFallsBackToStreamCipherAfterStrictAESRejection(t *testing.
 	}
 	if !bytes.Equal(result.Plaintext, plaintext) {
 		t.Fatal("plaintext mismatch")
+	}
+}
+
+func TestDecryptRootfsAcceptsKeyCounterHashAESWithNewcRootfs(t *testing.T) {
+	key := genTestRSAKey(t)
+	kernel := make([]byte, 2048)
+	if _, err := rand.Read(kernel); err != nil {
+		t.Fatal(err)
+	}
+	embedXORCandidate(t, kernel, 256, key)
+
+	plaintext := buildGzipNewc(t)
+	aesKey := make([]byte, 32)
+	counter := make([]byte, 16)
+	if _, err := rand.Read(aesKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(counter); err != nil {
+		t.Fatal(err)
+	}
+	rootfs := buildKeyBeforeCounterRootfs(t, key, "suffix", plaintext, aesKey, aesKey, counter, false)
+	result, err := DecryptRootfs(context.Background(), kernel, rootfs)
+	if err != nil {
+		t.Fatalf("DecryptRootfs: %v", err)
+	}
+	if result.Cipher != "aes-ctr" || !result.HashOK {
+		t.Fatalf("cipher=%q HashOK=%v, want aes-ctr/true", result.Cipher, result.HashOK)
+	}
+	if !bytes.Equal(result.Plaintext, plaintext) {
+		t.Fatal("plaintext mismatch")
+	}
+}
+
+func TestValidCompleteGzipNewcRejectsIncompleteOrTrailingData(t *testing.T) {
+	var missingTrailer bytes.Buffer
+	writeNewcRecord(t, &missingTrailer, "bin/init", 0o100755, []byte("synthetic-init"))
+	complete := buildNewc(t)
+	badChecksum := append([]byte(nil), gzipBytes(t, complete)...)
+	badChecksum[len(badChecksum)-1] ^= 0xff
+	tests := map[string][]byte{
+		"missing-trailer": gzipBytes(t, missingTrailer.Bytes()),
+		"nonzero-tail":    gzipBytes(t, append(append([]byte(nil), complete...), 1)),
+		"bad-checksum":    badChecksum,
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			if validCompleteGzipNewc(data) {
+				t.Fatal("invalid newc rootfs accepted")
+			}
+		})
+	}
+}
+
+func TestValidCompleteGzipNewcEnforcesExpandedLimit(t *testing.T) {
+	plain := buildNewc(t)
+	compressed := gzipBytes(t, plain)
+	if !validCompleteGzipNewcWithin(context.Background(), compressed, int64(len(plain))) {
+		t.Fatal("newc rootfs at expanded limit rejected")
+	}
+	if validCompleteGzipNewcWithin(context.Background(), compressed, int64(len(plain)-1)) {
+		t.Fatal("newc rootfs beyond expanded limit accepted")
+	}
+}
+
+func TestValidCompleteGzipTarEnforcesExpandedLimit(t *testing.T) {
+	plain := buildTar(t)
+	compressed := gzipBytes(t, plain)
+	if !validCompleteGzipTarWithin(context.Background(), compressed, int64(len(plain))) {
+		t.Fatal("tar rootfs at expanded limit rejected")
+	}
+	if validCompleteGzipTarWithin(context.Background(), compressed, int64(len(plain)-1)) {
+		t.Fatal("tar rootfs beyond expanded limit accepted")
+	}
+}
+
+func TestValidateCompleteNewcHonoursCancellationDuringBody(t *testing.T) {
+	var archive bytes.Buffer
+	writeNewcRecord(t, &archive, "bin/init", 0o100755, bytes.Repeat([]byte("x"), 1<<20))
+	writeNewcRecord(t, &archive, "TRAILER!!!", 0, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &cancelAfterReader{r: bytes.NewReader(archive.Bytes()), remaining: 256, cancel: cancel}
+	if validateCompleteNewc(&contextReader{ctx: ctx, r: r}) {
+		t.Fatal("cancelled newc validation succeeded")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("context error = %v, want canceled", ctx.Err())
 	}
 }
 
@@ -997,10 +1135,10 @@ func TestTryAESCTRReportsMismatchedBodyHash(t *testing.T) {
 	plaintext := append([]byte{0x1f, 0x8b}, bytes.Repeat([]byte{0x42}, 64)...)
 	body := aesCustomCTR(payload[48:80], payload[32:40], getLE64(payload[40:48]), counterStep(payload[32:48]), plaintext)
 	bodyHash := bytes.Repeat([]byte{0x42}, sha256.Size)
-	if _, handled := tryAESCTRKeyBeforeCounter(payload, body, bodyHash); handled {
+	if _, handled := tryAESCTRKeyBeforeCounter(context.Background(), payload, body, bodyHash); handled {
 		t.Fatal("legacy fixture is structurally ambiguous with a strict layout")
 	}
-	result := tryAESCTR(payload, body, bodyHash)
+	result := tryAESCTR(context.Background(), payload, body, bodyHash)
 	if result == nil {
 		t.Fatal("expected a plausible AES plaintext despite the mismatched body hash")
 	}

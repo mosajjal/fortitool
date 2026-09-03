@@ -8,7 +8,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
+	"strconv"
 )
 
 var (
@@ -58,7 +60,10 @@ func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		result, envelopeOK := decryptRootfsCandidate(sm, rootfsGz)
+		result, envelopeOK := decryptRootfsCandidate(ctx, sm, rootfsGz)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if envelopeOK {
 			validEnvelopes++
 		}
@@ -76,7 +81,7 @@ func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result
 	}
 }
 
-func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
+func decryptRootfsCandidate(ctx context.Context, sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 	modLen := (sm.Key.N.BitLen() + 7) / 8
 	if len(rootfsGz) <= modLen {
 		return nil, false
@@ -95,9 +100,12 @@ func decryptRootfsCandidate(sm *SeedMaterial, rootfsGz []byte) (*Result, bool) {
 
 	bodyHash := sha256.Sum256(body)
 
-	if r := tryAESCTR(payload, body, bodyHash[:]); r != nil {
+	if r := tryAESCTR(ctx, payload, body, bodyHash[:]); r != nil {
 		r.Seed = sm
 		return r, true
+	}
+	if ctx.Err() != nil {
+		return nil, true
 	}
 	if r := tryChaCha20Body(sm, body, bodyHash[:]); r != nil {
 		r.Seed = sm
@@ -147,8 +155,8 @@ func tryChaCha20Body(sm *SeedMaterial, body, bodyHash []byte) *Result {
 	return nil
 }
 
-func tryAESCTR(payload, body, bodyHash []byte) *Result {
-	if r, handled := tryAESCTRKeyBeforeCounter(payload, body, bodyHash); handled {
+func tryAESCTR(ctx context.Context, payload, body, bodyHash []byte) *Result {
+	if r, handled := tryAESCTRKeyBeforeCounter(ctx, payload, body, bodyHash); handled {
 		return r
 	}
 	return tryAESCTRLegacy(payload, body, bodyHash)
@@ -156,7 +164,7 @@ func tryAESCTR(payload, body, bodyHash []byte) *Result {
 
 // Some 80-byte payloads place the 32-byte key immediately before the
 // 16-byte counter, with the ciphertext digest at either end.
-func tryAESCTRKeyBeforeCounter(payload, body, bodyHash []byte) (*Result, bool) {
+func tryAESCTRKeyBeforeCounter(ctx context.Context, payload, body, bodyHash []byte) (*Result, bool) {
 	if len(payload) < 80 {
 		return nil, false
 	}
@@ -191,7 +199,7 @@ func tryAESCTRKeyBeforeCounter(payload, body, bodyHash []byte) (*Result, bool) {
 		return nil, true
 	}
 	plain := aesCustomCTR(l.aeskey, l.ctr[:8], getLE64(l.ctr[8:16]), counterStep(l.ctr), body)
-	if !validCompleteGzipTar(plain) {
+	if !validCompleteGzipRootfs(ctx, plain) {
 		return nil, true
 	}
 	return &Result{
@@ -200,7 +208,105 @@ func tryAESCTRKeyBeforeCounter(payload, body, bodyHash []byte) (*Result, bool) {
 	}, true
 }
 
+func validCompleteGzipRootfs(ctx context.Context, data []byte) bool {
+	return validCompleteGzipTarWithin(ctx, data, rootfsValidationMaxExpanded) ||
+		validCompleteGzipNewcWithin(ctx, data, rootfsValidationMaxExpanded)
+}
+
+// validCompleteGzipNewc validates the other rootfs container accepted by the
+// downstream extractor. Some appliance builds use gzip-wrapped ASCII newc
+// CPIO rather than tar, so rejecting it here would discard a cryptographically
+// valid AES candidate before extraction gets a chance to classify it.
+func validCompleteGzipNewc(data []byte) bool {
+	return validCompleteGzipNewcWithin(context.Background(), data, rootfsValidationMaxExpanded)
+}
+
+func validCompleteGzipNewcWithin(ctx context.Context, data []byte, maxExpanded int64) bool {
+	if maxExpanded < 0 || maxExpanded == math.MaxInt64 {
+		return false
+	}
+	compressed := bytes.NewReader(data)
+	gz, err := gzip.NewReader(compressed)
+	if err != nil {
+		return false
+	}
+	gz.Multistream(false)
+	expanded := &io.LimitedReader{R: &contextReader{ctx: ctx, r: gz}, N: maxExpanded + 1}
+	valid := validateCompleteNewc(expanded)
+	closeErr := gz.Close()
+	return valid && expanded.N > 0 && ctx.Err() == nil && closeErr == nil && compressed.Len() == 0
+}
+
+func validateCompleteNewc(r io.Reader) bool {
+	const (
+		magic      = "070701"
+		headerSize = 110
+		trailer    = "TRAILER!!!"
+		maxName    = 1 << 20
+	)
+	for {
+		header := make([]byte, headerSize)
+		if _, err := io.ReadFull(r, header); err != nil || string(header[:6]) != magic {
+			return false
+		}
+		fields := make([]uint64, 13)
+		for i := range fields {
+			value, err := strconv.ParseUint(string(header[6+i*8:14+i*8]), 16, 32)
+			if err != nil {
+				return false
+			}
+			fields[i] = value
+		}
+		fileSize, nameSize, check := fields[6], fields[11], fields[12]
+		if check != 0 || nameSize == 0 || nameSize > maxName || nameSize > math.MaxInt {
+			return false
+		}
+		nameBytes := make([]byte, int(nameSize))
+		if _, err := io.ReadFull(r, nameBytes); err != nil || nameBytes[len(nameBytes)-1] != 0 || bytes.IndexByte(nameBytes[:len(nameBytes)-1], 0) >= 0 {
+			return false
+		}
+		if !readZeroPadding(r, uint64(headerSize)+nameSize, 4) {
+			return false
+		}
+		if string(nameBytes[:len(nameBytes)-1]) == trailer {
+			if fileSize != 0 {
+				return false
+			}
+			tail := &zeroCheckingWriter{}
+			_, err := io.Copy(tail, r)
+			return err == nil && !tail.nonZero
+		}
+		if fileSize > math.MaxInt64 {
+			return false
+		}
+		if _, err := io.CopyN(io.Discard, r, int64(fileSize)); err != nil || !readZeroPadding(r, fileSize, 4) {
+			return false
+		}
+	}
+}
+
+func readZeroPadding(r io.Reader, size, alignment uint64) bool {
+	padding := (alignment - size%alignment) % alignment
+	var raw [3]byte
+	if _, err := io.ReadFull(r, raw[:padding]); err != nil {
+		return false
+	}
+	for _, b := range raw[:padding] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func validCompleteGzipTar(data []byte) bool {
+	return validCompleteGzipTarWithin(context.Background(), data, rootfsValidationMaxExpanded)
+}
+
+func validCompleteGzipTarWithin(ctx context.Context, data []byte, maxExpanded int64) bool {
+	if maxExpanded < 0 || maxExpanded == math.MaxInt64 {
+		return false
+	}
 	// A standard tar record is 20 blocks; tar.Reader consumes two end blocks.
 	const maxTarRecordPadding = 18 * 512
 
@@ -210,7 +316,8 @@ func validCompleteGzipTar(data []byte) bool {
 		return false
 	}
 	gz.Multistream(false)
-	counted := &countingReader{r: gz}
+	expanded := &io.LimitedReader{R: &contextReader{ctx: ctx, r: gz}, N: maxExpanded + 1}
+	counted := &countingReader{r: expanded}
 	tr := tar.NewReader(counted)
 	for {
 		memberEnd := counted.n
@@ -233,9 +340,21 @@ func validCompleteGzipTar(data []byte) bool {
 		}
 	}
 	padding := &zeroCheckingWriter{}
-	n, err := io.Copy(padding, io.LimitReader(gz, maxTarRecordPadding+1))
+	n, err := io.Copy(padding, io.LimitReader(expanded, maxTarRecordPadding+1))
 	closeErr := gz.Close()
-	return err == nil && n <= maxTarRecordPadding && !padding.nonZero && closeErr == nil && compressed.Len() == 0
+	return err == nil && n <= maxTarRecordPadding && !padding.nonZero && expanded.N > 0 && ctx.Err() == nil && closeErr == nil && compressed.Len() == 0
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }
 
 type countingReader struct {

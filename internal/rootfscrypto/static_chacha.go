@@ -13,11 +13,11 @@ import (
 )
 
 const (
-	staticChaChaStateLen     = 48
-	staticChaChaAlignment    = 4
-	staticChaChaSignatureLen = 256
-	staticChaChaBlockSize    = 64
-	staticChaChaMaxExpanded  = int64(4 << 30)
+	staticChaChaStateLen        = 48
+	staticChaChaAlignment       = 4
+	staticChaChaSignatureLen    = 256
+	staticChaChaBlockSize       = 64
+	rootfsValidationMaxExpanded = int64(4 << 30)
 )
 
 // Optistream's Apache-2.0 fortigate-crypto implementation documents this
@@ -92,7 +92,7 @@ func decryptWithStaticChaCha20(state, data []byte) ([]byte, error) {
 }
 
 func validGzipTar(data []byte) bool {
-	return validGzipTarWithin(data, staticChaChaMaxExpanded)
+	return validGzipTarWithin(data, rootfsValidationMaxExpanded)
 }
 
 func validGzipTarWithin(data []byte, maxExpanded int64) bool {
