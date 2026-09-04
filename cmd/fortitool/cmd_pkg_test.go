@@ -134,7 +134,11 @@ func TestCmdPkgInspectVerificationPolicy(t *testing.T) {
 }
 
 func TestCmdPkgScanRegularFilesAndSuggestion(t *testing.T) {
-	root := t.TempDir()
+	t.Chdir(t.TempDir())
+	root := "packages"
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	payload := []byte("synthetic package payload")
 	certDER, privateKey := buildPackageTestCertificate(t)
 	signature := buildPackageSignedData(t, certDER, privateKey, payload, []bool{true})
@@ -146,11 +150,18 @@ func TestCmdPkgScanRegularFilesAndSuggestion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdPkgScan: %v", err)
 	}
+	wantSuggestion := "fortitool pkg inspect --content 'packages/component' 'packages/component.x'"
+	if runtime.GOOS == "windows" {
+		wantSuggestion = "no copyable command"
+		if strings.Contains(stdout, "--content") {
+			t.Fatalf("stdout contains a copyable Windows command:\n%s", stdout)
+		}
+	}
 	for _, want := range []string{
 		"Scanned 3 regular files",
 		"== ELF (1) ==",
 		"== PKCS#7 SignedData (1) ==",
-		pkgInspectSuggestion(runtime.GOOS, filepath.Join(root, "component"), filepath.Join(root, "component.x")),
+		wantSuggestion,
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout does not contain %q:\n%s", want, stdout)
@@ -190,7 +201,11 @@ func TestCmdPkgScanOmitsSuggestionForControlPaths(t *testing.T) {
 }
 
 func TestCmdPkgScanHandlesPrintableShellMetacharacters(t *testing.T) {
-	root := t.TempDir()
+	t.Chdir(t.TempDir())
+	root := "packages"
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	payloadName := "component $(echo unsafe) 'payload"
 	signatureName := payloadName + ".x"
 	payload := []byte("synthetic package payload")
@@ -203,9 +218,13 @@ func TestCmdPkgScanHandlesPrintableShellMetacharacters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdPkgScan: %v", err)
 	}
-	contentPath := filepath.Join(root, payloadName)
-	signaturePath := filepath.Join(root, signatureName)
-	want := pkgInspectSuggestion(runtime.GOOS, contentPath, signaturePath)
+	want := `fortitool pkg inspect --content 'packages/component $(echo unsafe) '"'"'payload' 'packages/component $(echo unsafe) '"'"'payload.x'`
+	if runtime.GOOS == "windows" {
+		want = "no copyable command"
+		if strings.Contains(stdout, "--content") {
+			t.Fatalf("stdout contains a copyable Windows command:\n%s", stdout)
+		}
+	}
 	if !strings.Contains(stdout, want) {
 		t.Fatalf("stdout does not contain safely quoted rooted suggestion %q:\n%s", want, stdout)
 	}

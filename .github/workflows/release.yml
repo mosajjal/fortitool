@@ -122,6 +122,9 @@ jobs:
           }
       - name: Run native tests
         run: go test -mod=readonly -count=1 ./...
+      - name: Test release workflow checks
+        if: matrix.id == 'linux-amd64'
+        run: python3 .github/scripts/test_release.py
       - name: Exercise Windows DACL and output tests
         if: matrix.goos == 'windows'
         run: |
@@ -197,11 +200,13 @@ jobs:
         if: matrix.goos == 'linux'
         run: |
           binary="$RUNNER_TEMP/extracted/$PACKAGE_NAME/$TARGET_BINARY"
-          if readelf -lW "$binary" | grep -Eq '^[[:space:]]*INTERP[[:space:]]'; then
+          headers="$(readelf -lW "$binary")"
+          dynamic="$(readelf -dW "$binary")"
+          if grep -Eq '^[[:space:]]*INTERP[[:space:]]' <<<"$headers"; then
             echo 'release binary contains an ELF interpreter'
             exit 1
           fi
-          if readelf -dW "$binary" 2>&1 | grep -Fq '(NEEDED)'; then
+          if grep -Fq '(NEEDED)' <<<"$dynamic"; then
             echo 'release binary contains a dynamic dependency'
             exit 1
           fi
@@ -315,7 +320,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          release_args=()
+          if [[ "${RELEASE_VERSION%%+*}" == *-* ]]; then
+            release_args=(--prerelease --latest=false)
+          fi
           gh release create "$RELEASE_VERSION" release/* \
             --verify-tag \
             --title "$RELEASE_VERSION" \
-            --generate-notes
+            --generate-notes "${release_args[@]}"
