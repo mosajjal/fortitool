@@ -28,7 +28,7 @@ func TestSafeExtractSymlinkTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "../../sbin/init" {
+	if got != filepath.FromSlash("../../sbin/init") {
 		t.Fatalf("rebased absolute target = %q", got)
 	}
 }
@@ -248,7 +248,7 @@ func TestExtractAllRebasesRepeatedSymlinkPerPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deepTarget != "../small.txt" {
+	if deepTarget != filepath.FromSlash("../small.txt") {
 		t.Fatalf("nested symlink target = %q, want %q", deepTarget, "../small.txt")
 	}
 }

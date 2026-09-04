@@ -9,7 +9,11 @@ pentest/research engagement). Refuse or ask first if that's unclear.
 
 ## Get the binary
 
-Check `fortitool -h` first. If not on PATH:
+Check `fortitool -h` first. If not on PATH, download the archive for the current
+platform from https://github.com/mosajjal/fortitool/releases, verify it against
+the release's SHA-256 checksum file, and put the extracted binary on PATH.
+
+Alternatively, install with Go:
 
 ```sh
 go install github.com/mosajjal/fortitool/cmd/fortitool@latest
