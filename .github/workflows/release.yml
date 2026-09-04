@@ -1,0 +1,321 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  build:
+    name: Native ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-amd64
+            label: Linux/amd64
+            runner: ubuntu-24.04
+            runner-os: Linux
+            runner-arch: X64
+            native-arch: x86_64
+            goos: linux
+            goarch: amd64
+            binary: fortitool
+            archive: tar.gz
+          - id: linux-arm64
+            label: Linux/arm64
+            runner: ubuntu-24.04-arm
+            runner-os: Linux
+            runner-arch: ARM64
+            native-arch: aarch64
+            goos: linux
+            goarch: arm64
+            binary: fortitool
+            archive: tar.gz
+          - id: windows-amd64
+            label: Windows/amd64
+            runner: windows-2025
+            runner-os: Windows
+            runner-arch: X64
+            native-arch: X64
+            goos: windows
+            goarch: amd64
+            binary: fortitool.exe
+            archive: zip
+          - id: darwin-arm64
+            label: macOS/arm64
+            runner: macos-15
+            runner-os: macOS
+            runner-arch: ARM64
+            native-arch: arm64
+            goos: darwin
+            goarch: arm64
+            binary: fortitool
+            archive: tar.gz
+    env:
+      CGO_ENABLED: '0'
+      TARGET_ID: ${{ matrix.id }}
+      TARGET_GOOS: ${{ matrix.goos }}
+      TARGET_GOARCH: ${{ matrix.goarch }}
+      TARGET_BINARY: ${{ matrix.binary }}
+      EXPECTED_RUNNER_OS: ${{ matrix.runner-os }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner-arch }}
+      EXPECTED_NATIVE_ARCH: ${{ matrix.native-arch }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go 1.26.6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.6'
+          check-latest: false
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Resolve version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = push ]; then
+            version="$REF_NAME"
+            if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "release tag is not a version tag: $version"
+              exit 1
+            fi
+          else
+            version="pr-${GITHUB_SHA}"
+          fi
+          printf 'RELEASE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+      - name: Assert native runner and toolchain
+        run: |
+          test "$RUNNER_OS" = "$EXPECTED_RUNNER_OS"
+          test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH"
+          test "$(go env GOHOSTOS)" = "$TARGET_GOOS"
+          test "$(go env GOHOSTARCH)" = "$TARGET_GOARCH"
+          test "$(go env GOVERSION)" = go1.26.6
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Assert Unix host architecture
+        if: matrix.goos != 'windows'
+        run: test "$(uname -m)" = "$EXPECTED_NATIVE_ARCH"
+      - name: Assert Windows host architecture
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($architecture -ne $env:EXPECTED_NATIVE_ARCH) {
+            throw "unexpected native architecture: $architecture"
+          }
+      - name: Run native tests
+        run: go test -mod=readonly -count=1 ./...
+      - name: Exercise Windows DACL and output tests
+        if: matrix.goos == 'windows'
+        run: |
+          log="$RUNNER_TEMP/windows-tests.log"
+          go test -mod=readonly -count=1 -v ./cmd/fortitool -run '^TestWindows' | tee "$log"
+          if grep -Fq -- '--- SKIP:' "$log"; then
+            echo 'Windows DACL/output test skipped'
+            exit 1
+          fi
+          windows_tests=(
+            TestWindowsPrivateStagingDACLIsInheritedAndSurvivesRename
+            TestWindowsPrivateFileDACLIsPreservedByHardLinkPublication
+            TestWindowsPrivateOutputCollisionAndCleanup
+            TestWindowsUnsupportedACLFilesystemFailsClosed
+            TestWindowsPrivateTempRetriesNameCollision
+            TestWindowsPrivateTempSupportsLongParentPath
+          )
+          for test_name in "${windows_tests[@]}"; do
+            grep -Fq -- "--- PASS: $test_name (" "$log"
+          done
+      - name: Check non-injected version control
+        run: |
+          control="$RUNNER_TEMP/default-$TARGET_BINARY"
+          go build -buildvcs=true -mod=readonly -trimpath -o "$control" ./cmd/fortitool
+          reported_version="$("$control" version)"
+          test "$reported_version" = 'fortitool 0.1.0'
+          test "$reported_version" != "fortitool $RELEASE_VERSION"
+      - name: Build packaged binary
+        run: |
+          package_name="fortitool-${RELEASE_VERSION}-${TARGET_ID}"
+          package_dir="$RUNNER_TEMP/package/$package_name"
+          mkdir -p "$package_dir"
+          go build -buildvcs=true -mod=readonly -trimpath \
+            -ldflags "-X main.version=$RELEASE_VERSION" \
+            -o "$package_dir/$TARGET_BINARY" ./cmd/fortitool
+          cp LICENSE "$package_dir/LICENSE"
+          printf 'PACKAGE_NAME=%s\n' "$package_name" >> "$GITHUB_ENV"
+          printf 'PACKAGE_DIR=%s\n' "$package_dir" >> "$GITHUB_ENV"
+      - name: Check binary VCS metadata
+        run: |
+          metadata="$(go version -m "$PACKAGE_DIR/$TARGET_BINARY")"
+          printf '%s\n' "$metadata"
+          grep -Fq $'\tbuild\tvcs=git' <<<"$metadata"
+          grep -Fq $'\tbuild\tvcs.revision='"$GITHUB_SHA" <<<"$metadata"
+          grep -Fq $'\tbuild\tvcs.modified=false' <<<"$metadata"
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        run: |
+          archive="$RUNNER_TEMP/release/$PACKAGE_NAME.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          tar -C "$RUNNER_TEMP/package" -czf "$archive" "$PACKAGE_NAME"
+          printf 'RELEASE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:RUNNER_TEMP 'release'
+          $archive = Join-Path $releaseDir "$env:PACKAGE_NAME.zip"
+          New-Item -ItemType Directory -Force $releaseDir | Out-Null
+          Compress-Archive -LiteralPath $env:PACKAGE_DIR -DestinationPath $archive
+          "RELEASE_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Extract and test Unix archive
+        if: matrix.archive == 'tar.gz'
+        run: |
+          extract_dir="$RUNNER_TEMP/extracted"
+          mkdir -p "$extract_dir"
+          tar -xzf "$RELEASE_ARCHIVE" -C "$extract_dir"
+          binary="$extract_dir/$PACKAGE_NAME/$TARGET_BINARY"
+          test "$("$binary" version)" = "fortitool $RELEASE_VERSION"
+          "$binary" -h >/dev/null
+          test -f "$extract_dir/$PACKAGE_NAME/LICENSE"
+      - name: Check extracted Linux binary is static
+        if: matrix.goos == 'linux'
+        run: |
+          binary="$RUNNER_TEMP/extracted/$PACKAGE_NAME/$TARGET_BINARY"
+          if readelf -lW "$binary" | grep -Eq '^[[:space:]]*INTERP[[:space:]]'; then
+            echo 'release binary contains an ELF interpreter'
+            exit 1
+          fi
+          if readelf -dW "$binary" 2>&1 | grep -Fq '(NEEDED)'; then
+            echo 'release binary contains a dynamic dependency'
+            exit 1
+          fi
+      - name: Extract and test Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $extractDir = Join-Path $env:RUNNER_TEMP 'extracted'
+          Expand-Archive -LiteralPath $env:RELEASE_ARCHIVE -DestinationPath $extractDir
+          $binary = Join-Path $extractDir "$env:PACKAGE_NAME\$env:TARGET_BINARY"
+          $reportedVersion = & $binary version
+          if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "fortitool $env:RELEASE_VERSION") {
+            throw "unexpected version output: $reportedVersion"
+          }
+          & $binary -h | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw 'fortitool -h failed'
+          }
+          if (-not (Test-Path (Join-Path $extractDir "$env:PACKAGE_NAME\LICENSE"))) {
+            throw 'LICENSE is missing from archive'
+          }
+      - name: Upload tested archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.id }}
+          path: ${{ env.RELEASE_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble and checksum archives
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Resolve version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = push ]; then
+            version="$REF_NAME"
+            if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "release tag is not a version tag: $version"
+              exit 1
+            fi
+          else
+            version="pr-${GITHUB_SHA}"
+          fi
+          printf 'RELEASE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+      - name: Download tested archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Validate archive set and checksums
+        run: |
+          cd release
+          expected=(
+            "fortitool-${RELEASE_VERSION}-linux-amd64.tar.gz"
+            "fortitool-${RELEASE_VERSION}-linux-arm64.tar.gz"
+            "fortitool-${RELEASE_VERSION}-windows-amd64.zip"
+            "fortitool-${RELEASE_VERSION}-darwin-arm64.tar.gz"
+          )
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
+          for archive in "${expected[@]}"; do
+            test -f "$archive"
+          done
+          checksum_file="fortitool-${RELEASE_VERSION}-checksums.txt"
+          sha256sum -- "${expected[@]}" > "$checksum_file"
+          sha256sum -c -- "$checksum_file"
+      - name: Upload complete release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-files
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Validate version tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag is not a version tag: $REF_NAME"
+            exit 1
+          fi
+          printf 'RELEASE_VERSION=%s\n' "$REF_NAME" >> "$GITHUB_ENV"
+      - name: Download complete release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-files
+          path: release
+      - name: Revalidate release files
+        run: |
+          cd release
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
+          sha256sum -c -- "fortitool-${RELEASE_VERSION}-checksums.txt"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_VERSION" release/* \
+            --verify-tag \
+            --title "$RELEASE_VERSION" \
+            --generate-notes

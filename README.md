@@ -15,6 +15,14 @@ out of several version-specific ones (`forticrack`, `fgx`, `forticrack_v8`,
 
 ## Install
 
+Download the archive for your platform from the
+[GitHub releases](https://github.com/mosajjal/fortitool/releases). Each release
+includes a SHA-256 checksum file covering every prebuilt-binary archive.
+Extract the archive, put `fortitool` (or `fortitool.exe`) on your `PATH`, and
+run `fortitool version` to confirm the installed tag.
+
+Alternatively, install with Go:
+
 ```sh
 go install github.com/mosajjal/fortitool/cmd/fortitool@latest
 ```
