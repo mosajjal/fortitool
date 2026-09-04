@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -37,6 +38,10 @@ func TestCLIExitCodeContract(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	output := filepath.Join(t.TempDir(), "output")
 	emptyDir := t.TempDir()
+	missingError := "no such file"
+	if runtime.GOOS == "windows" {
+		missingError = "cannot find the file specified"
+	}
 
 	tests := []struct {
 		name     string
@@ -55,7 +60,7 @@ func TestCLIExitCodeContract(t *testing.T) {
 		{name: "decrypt help", args: []string{"decrypt", "-h"}, wantCode: 0, wantText: "fortitool decrypt --"},
 		{name: "decrypt missing arguments", args: []string{"decrypt"}, wantCode: 2, wantText: "usage: fortitool decrypt"},
 		{name: "decrypt extra argument", args: []string{"decrypt", "-o", output, missing, "extra"}, wantCode: 2, wantText: "usage: fortitool decrypt"},
-		{name: "decrypt runtime failure", args: []string{"decrypt", "-o", output, missing}, wantCode: 1, wantText: "no such file"},
+		{name: "decrypt runtime failure", args: []string{"decrypt", "-o", output, missing}, wantCode: 1, wantText: missingError},
 
 		{name: "inspect help", args: []string{"inspect", "-h"}, wantCode: 0, wantText: "fortitool inspect --"},
 		{name: "inspect missing argument", args: []string{"inspect"}, wantCode: 2, wantText: "usage: fortitool inspect"},
@@ -66,18 +71,18 @@ func TestCLIExitCodeContract(t *testing.T) {
 		{name: "l1 missing argument", args: []string{"l1"}, wantCode: 2, wantText: "usage: fortitool l1"},
 		{name: "l1 extra argument", args: []string{"l1", missing, "extra"}, wantCode: 2, wantText: "usage: fortitool l1"},
 		{name: "l1 invalid flag", args: []string{"l1", "--invalid"}, wantCode: 2, wantText: "flag provided but not defined"},
-		{name: "l1 runtime failure", args: []string{"l1", missing}, wantCode: 1, wantText: "no such file"},
+		{name: "l1 runtime failure", args: []string{"l1", missing}, wantCode: 1, wantText: missingError},
 
 		{name: "rootfs help", args: []string{"rootfs", "-h"}, wantCode: 0, wantText: "fortitool rootfs --"},
 		{name: "rootfs missing arguments", args: []string{"rootfs", missing}, wantCode: 2, wantText: "usage: fortitool rootfs"},
 		{name: "rootfs extra argument", args: []string{"rootfs", missing, missing, "extra"}, wantCode: 2, wantText: "usage: fortitool rootfs"},
-		{name: "rootfs runtime failure", args: []string{"rootfs", missing, missing}, wantCode: 1, wantText: "no such file"},
+		{name: "rootfs runtime failure", args: []string{"rootfs", missing, missing}, wantCode: 1, wantText: missingError},
 
 		{name: "unpack help", args: []string{"unpack", "-h"}, wantCode: 0, wantText: "fortitool unpack --"},
 		{name: "unpack missing arguments", args: []string{"unpack"}, wantCode: 2, wantText: "usage: fortitool unpack"},
 		{name: "unpack missing output", args: []string{"unpack", missing}, wantCode: 2, wantText: "usage: fortitool unpack"},
 		{name: "unpack extra argument", args: []string{"unpack", "-o", output, missing, "extra"}, wantCode: 2, wantText: "usage: fortitool unpack"},
-		{name: "unpack runtime failure", args: []string{"unpack", "-o", output, missing}, wantCode: 1, wantText: "no such file"},
+		{name: "unpack runtime failure", args: []string{"unpack", "-o", output, missing}, wantCode: 1, wantText: missingError},
 
 		{name: "config help", args: []string{"config", "-h"}, wantCode: 0, wantText: "fortitool config decrypt --"},
 		{name: "config missing subcommand", args: []string{"config"}, wantCode: 2, wantText: "usage: fortitool config decrypt"},
@@ -93,11 +98,11 @@ func TestCLIExitCodeContract(t *testing.T) {
 		{name: "pkg inspect help", args: []string{"pkg", "inspect", "-h"}, wantCode: 0, wantText: "fortitool pkg --"},
 		{name: "pkg inspect missing signature", args: []string{"pkg", "inspect"}, wantCode: 2, wantText: "usage: fortitool pkg inspect"},
 		{name: "pkg inspect extra signature", args: []string{"pkg", "inspect", missing, "extra"}, wantCode: 2, wantText: "usage: fortitool pkg inspect"},
-		{name: "pkg inspect runtime failure", args: []string{"pkg", "inspect", missing}, wantCode: 1, wantText: "no such file"},
+		{name: "pkg inspect runtime failure", args: []string{"pkg", "inspect", missing}, wantCode: 1, wantText: missingError},
 		{name: "pkg scan help", args: []string{"pkg", "scan", "-h"}, wantCode: 0, wantText: "fortitool pkg --"},
 		{name: "pkg scan missing directory", args: []string{"pkg", "scan"}, wantCode: 2, wantText: "usage: fortitool pkg scan"},
 		{name: "pkg scan extra directory", args: []string{"pkg", "scan", emptyDir, "extra"}, wantCode: 2, wantText: "usage: fortitool pkg scan"},
-		{name: "pkg scan runtime failure", args: []string{"pkg", "scan", missing}, wantCode: 1, wantText: "no such file"},
+		{name: "pkg scan runtime failure", args: []string{"pkg", "scan", missing}, wantCode: 1, wantText: missingError},
 		{name: "pkg scan success", args: []string{"pkg", "scan", emptyDir}, wantCode: 0, wantText: "Scanned 0 regular files"},
 	}
 

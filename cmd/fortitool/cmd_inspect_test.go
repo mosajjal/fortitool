@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -260,7 +261,11 @@ func TestInspectRejectsKeyFlagAndHidesInaccessiblePath(t *testing.T) {
 	if strings.Contains(result.stdout+result.stderr, privatePath) || strings.Contains(result.stdout+result.stderr, "\x1b") {
 		t.Fatalf("private/control path was exposed:\n%s%s", result.stdout, result.stderr)
 	}
-	if !strings.Contains(result.stderr, "input file does not exist") {
+	wantError := "input file does not exist"
+	if runtime.GOOS == "windows" {
+		wantError = "input file is inaccessible"
+	}
+	if !strings.Contains(result.stderr, wantError) {
 		t.Fatalf("stderr = %q", result.stderr)
 	}
 
