@@ -56,20 +56,32 @@ func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result
 
 	var matches []*Result
 	validEnvelopes := 0
-	for _, sm := range candidates {
+	for pending := candidates; len(pending) != 0; {
+		for _, sm := range pending {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			result, envelopeOK := decryptRootfsCandidate(ctx, sm, rootfsGz)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if envelopeOK {
+				validEnvelopes++
+			}
+			if result != nil {
+				matches = append(matches, result)
+			}
+		}
+		// Unrelated XOR keys can suppress the actual ChaCha-protected key.
+		// Retry only after every XOR candidate fails rootfs validation.
+		if len(matches) != 0 || pending[0].Family != "xor" {
+			break
+		}
+		pending = scanChaChaFamily(ctx, kernelPayload)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		result, envelopeOK := decryptRootfsCandidate(ctx, sm, rootfsGz)
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if envelopeOK {
-			validEnvelopes++
-		}
-		if result != nil {
-			matches = append(matches, result)
-		}
+		candidates = append(candidates, pending...)
 	}
 	switch len(matches) {
 	case 1:
