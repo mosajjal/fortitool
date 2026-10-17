@@ -40,11 +40,20 @@ commit message or the README coverage table, as described in `CLAUDE.md`.
 Describe what was actually tested. Generated tests and cross-builds do not by
 themselves establish real-input or runtime compatibility.
 
+For new product or format coverage, identify the product, version/build,
+package type (for example, upgrade `.out` or KVM installation ZIP), and the
+last stage verified. Record inspection, decryption and extraction separately;
+success with an installation disk does not establish upgrade-package or
+hardware-appliance support. Keep firmware and derived files private.
+
 ## Command and format changes
 
 Command changes must keep `-h` text, README examples, and
 `plugin/skills/fortios-firmware/SKILL.md` in step. Validate both plugin
 manifests with the commands in `CLAUDE.md`.
+
+When extending product coverage, also update the README scope and coverage
+table, plugin descriptions/keywords, and the architecture notes in `CLAUDE.md`.
 
 Credit public research next to the algorithm or format detail it informed.
 Add focused tests for success and rejection paths, and avoid unrelated cleanup.

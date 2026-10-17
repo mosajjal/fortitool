@@ -205,15 +205,25 @@ func ExtractXZTar(data []byte, destDir string) error {
 	return nil
 }
 
-// XZDecompress fully decompresses a raw xz stream (not a tar).
+// XZDecompress fully decompresses a raw xz stream (not a tar), up to 4 GiB.
 func XZDecompress(data []byte) ([]byte, error) {
+	return xzDecompress(data, 4<<30)
+}
+
+func xzDecompress(data []byte, maxExpanded int64) ([]byte, error) {
+	if maxExpanded <= 0 {
+		return nil, fmt.Errorf("xz: invalid expansion limit %d", maxExpanded)
+	}
 	xr, err := newXZReader(data)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := io.ReadAll(xr)
+	plain, err := io.ReadAll(io.LimitReader(xr, maxExpanded+1))
 	if err != nil {
 		return nil, fmt.Errorf("xz: %w", err)
+	}
+	if int64(len(plain)) > maxExpanded {
+		return nil, fmt.Errorf("xz: expands past %d bytes", maxExpanded)
 	}
 	return plain, nil
 }

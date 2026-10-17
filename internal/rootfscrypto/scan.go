@@ -3,7 +3,7 @@
 // RSAPublicKey DER blob hidden somewhere in the kernel (flatkc), used to
 // unwrap a per-image AES/RC4 key carried in rootfs.gz's trailing signature.
 //
-// Three storage families are known, and this package auto-detects them
+// The supported storage families are auto-detected
 // without any disassembly (miasm/objdump). The seed/RSA families exploit
 // that the blob always decrypts to a known ASN.1 DER prefix:
 //   - XOR family (7.6.x aarch64, 8.0 FORT-RC4): blob[i] ^ seed[i&0x1F]
@@ -11,6 +11,8 @@
 //     one of several observed byte-rotation splits
 //   - static ChaCha20 family: aligned key(32)+counter/nonce(16), selected only
 //     when the complete decrypted body is a valid gzip-compressed tar
+//   - static AES-128-CTR family (FAZ/FMG): adjacent key/IV, selected by the
+//     plaintext SHA-256 digest and complete XZ/CPIO validation
 package rootfscrypto
 
 import (

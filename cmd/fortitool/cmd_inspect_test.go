@@ -123,7 +123,7 @@ func TestCmdInspectReadablePartialStagesExitSuccessfully(t *testing.T) {
 				return syntheticDecryptImage(t, []byte("unsupported rootfs crypto"))
 			},
 			wantLast: inspectStageRequiredMembers, wantUnsupported: inspectStageRootfsCrypto,
-			wantReason: "extracting kernel payload from flatkc",
+			wantReason: "extracting kernel payload",
 		},
 	}
 	for _, tc := range tests {
@@ -293,12 +293,12 @@ func TestInspectAndDecryptConsumeSharedDecisions(t *testing.T) {
 	if report.flatkc != "present (16 bytes)" || report.rootfsGz != "present ("+strconv.Itoa(len(rootfs))+" bytes)" {
 		t.Fatalf("formatted members = %q/%q", report.flatkc, report.rootfsGz)
 	}
-	decision, err := decideRootfsCrypto(context.Background(), selection.RequiredMembers.Flatkc.Data, selection.RequiredMembers.RootfsGz.Data)
+	decision, err := decideRootfsCrypto(context.Background(), selection.RequiredMembers.Kernel.Data, selection.RequiredMembers.RootfsGz.Data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	decrypted, err := captureStdout(t, func() error {
-		got, err := decryptRootfsAuto(context.Background(), selection.RequiredMembers.Flatkc.Data, selection.RequiredMembers.RootfsGz.Data, false)
+		got, err := decryptRootfsAuto(context.Background(), selection.RequiredMembers.Kernel.Data, selection.RequiredMembers.RootfsGz.Data, false)
 		if err == nil && !bytes.Equal(got, decision.Plaintext) {
 			t.Fatal("decrypt and inspect rootfs plaintext decisions differ")
 		}
@@ -307,7 +307,7 @@ func TestInspectAndDecryptConsumeSharedDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(decrypted, "already plain gzip") {
+	if !strings.Contains(decrypted, "already compressed plaintext") {
 		t.Fatalf("decrypt output does not reflect shared plain decision: %s", decrypted)
 	}
 	container, err := classifyRootfsPayload(decision.Plaintext)

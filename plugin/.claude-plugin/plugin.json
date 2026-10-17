@@ -2,7 +2,7 @@
   "name": "fortitool",
   "displayName": "fortitool",
   "version": "0.1.0",
-  "description": "Decrypt and unpack FortiOS firmware end-to-end: the outer .out cipher, every known rootfs.gz crypto scheme (7.4.x-8.0, auto-detected), the ext3 firmware filesystem, tar/xz archives, PKCS#7 sub-component signatures, and config-backup secrets. One static Go binary, no OS packages required at runtime.",
+  "description": "Decrypt and unpack supported FortiGate/FortiWiFi FortiOS firmware and FortiAnalyzer/FortiManager KVM installation disks (QCOW2 or single-disk ZIP), with automatic format/crypto detection. Also inspect FortiGuard PKCS#7 signatures and decrypt FortiOS config-backup secrets. One static Go binary, no runtime OS packages.",
   "author": {
     "name": "Ali Mosajjal",
     "url": "https://github.com/mosajjal"
@@ -14,6 +14,8 @@
     "fortios",
     "fortigate",
     "fortiwifi",
+    "fortianalyzer",
+    "fortimanager",
     "fortinet",
     "firmware",
     "reverse-engineering",

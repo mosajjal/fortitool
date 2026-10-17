@@ -1,12 +1,8 @@
 // Command fortitool is a single self-contained binary for decrypting and
-// unpacking Fortinet FortiOS firmware images end-to-end: the outer ".out"
-// XOR cipher, every known rootfs.gz crypto scheme (7.4.x through 8.0,
-// auto-detected, no version/arch flag needed), the ext3 firmware
-// filesystem, nested tar+xz archives, PKCS#7 sub-component signatures, and
-// legacy config-backup secrets. No OS packages required at runtime -- every
-// format (gzip, tar, xz, ext2/3, ASN.1/PKCS#7, AES/RC4/ChaCha20) is
-// implemented in Go, and the binary is statically linked (build with
-// CGO_ENABLED=0).
+// unpacking supported FortiGate/FortiWiFi firmware and FortiAnalyzer/
+// FortiManager KVM installation disks. It also handles FortiOS config-backup
+// secrets and FortiGuard PKCS#7 signatures. Build with CGO_ENABLED=0 for a
+// static binary with no external runtime tools.
 package main
 
 import (
@@ -28,10 +24,10 @@ type command struct {
 }
 
 var commands = []command{
-	{"decrypt", "full pipeline: .out -> L1 decrypt -> ext3 -> rootfs decrypt -> unpack", cmdDecrypt},
+	{"decrypt", "extract .out or FAZ/FMG KVM disks; --boot-only preserves boot files", cmdDecrypt},
 	{"inspect", "describe one firmware image read-only, including partial support", cmdInspect},
 	{"l1", "outer .out XOR layer only (known-plaintext attack)", cmdL1},
-	{"rootfs", "rootfs.gz crypto layer only, any known FortiOS era, auto-detected", cmdRootfs},
+	{"rootfs", "supported rootfs.gz crypto with flatkc or vmlinuz, auto-detected", cmdRootfs},
 	{"unpack", "generic archive unpack: gzip+tar or xz+tar -> directory", cmdUnpack},
 	{"config", "decrypt a config-backup `ENC <base64>` secret field", cmdConfig},
 	{"pkg", "inspect/verify FortiGuard sub-component PKCS#7 signatures", cmdPkg},
@@ -115,10 +111,15 @@ func commandExitCode(err error) int {
 }
 
 func printTopLevelHelp(w io.Writer) {
-	fmt.Fprintf(w, `fortitool %s -- FortiOS firmware decryption/unpacking, one static binary, no OS deps
+	fmt.Fprintf(w, `fortitool %s -- Fortinet firmware decryption/unpacking, one static binary, no OS deps
 
 WHAT THIS IS
-  Fortinet firmware ships with multiple, version-dependent encryption
+  Supports FortiGate/FortiWiFi FortiOS firmware and tested FortiAnalyzer/
+  FortiManager KVM installation disks (bare QCOW2 or single-disk ZIP).
+  Config-secret decryption covers FortiOS backups. See the README for exact
+  product/build coverage and remaining limits.
+
+  Firmware ships with multiple, version-dependent encryption
   layers (see https://github.com/mosajjal/fortitool#supported-firmware for
   the full matrix). Historically, decrypting a single firmware image meant
   chaining several different tools (forticrack, fgx, forticrack_v8,

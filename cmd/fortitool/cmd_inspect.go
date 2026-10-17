@@ -8,12 +8,12 @@ import (
 	"os"
 
 	"github.com/mosajjal/fortitool/internal/diskimage"
-	"github.com/mosajjal/fortitool/internal/l1"
 )
 
 const (
 	inspectStageInput           = "input"
 	inspectStageOuterGzip       = "outer-gzip"
+	inspectStageOuterZIP        = "outer-zip"
 	inspectStageL1              = "l1"
 	inspectStageVolume          = "volume"
 	inspectStageRequiredMembers = "required-members"
@@ -30,6 +30,7 @@ type inspectReport struct {
 	diskLayout       string
 	selectedVolume   string
 	flatkc           string
+	vmlinuz          string
 	rootfsGz         string
 	rootfsFamily     string
 	rootfsCipher     string
@@ -44,7 +45,7 @@ func newInspectReport() *inspectReport {
 	return &inspectReport{
 		inputSize: "unknown", outerWrapper: "unknown", firmwareIdentity: "unknown",
 		l1State: "unknown", diskLayout: "unknown", selectedVolume: "unknown",
-		flatkc: "unknown", rootfsGz: "unknown", rootfsFamily: "unknown",
+		flatkc: "unknown", vmlinuz: "unknown", rootfsGz: "unknown", rootfsFamily: "unknown",
 		rootfsCipher: "unknown", rootfsContainer: "unknown", status: "partial",
 		lastStage: "none", unsupportedStage: inspectStageInput, reason: "inspection did not start",
 	}
@@ -73,6 +74,7 @@ func (r *inspectReport) print() {
 		{"disk-layout", r.diskLayout},
 		{"selected-volume", r.selectedVolume},
 		{"flatkc", r.flatkc},
+		{"vmlinuz", r.vmlinuz},
 		{"rootfs.gz", r.rootfsGz},
 		{"rootfs-key-family", r.rootfsFamily},
 		{"rootfs-body-cipher", r.rootfsCipher},
@@ -92,24 +94,32 @@ func cmdInspect(ctx context.Context, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool inspect -- describe a firmware image without extracting it
 
-Runs the existing firmware detection pipeline in read-only mode and reports
+Accepts .out firmware, QCOW2 disks and single-QCOW2 ZIP packages.
+Runs the firmware detection pipeline in read-only mode and reports
 how far the image is recognised. It does not create an output directory,
 extract files, alter the input, write temporary files or display recovered
 key material.
 
 USAGE
-  fortitool inspect <image.out>
+  fortitool inspect <image.out|disk.qcow2|image.zip>
 
 EXAMPLES
   fortitool inspect FWF_60E-v7.4.11-build2878-FORTINET.out
+  fortitool inspect FMG_VM64_KVM-v7.0.16-build0710-FORTINET.out.kvm.zip
   fortitool inspect unfamiliar-image.out
 
 OUTPUT
   Stable field: value lines report the decoded firmware identity, L1 state,
   disk and selected-volume layout, required-member sizes, rootfs crypto family
   and cipher, rootfs container, overall status and last successful stage.
+  QCOW2 disks without an L1 header report l1-state: not applicable. A validated
+  cleartext header retains its firmware identity. The flatkc and
+  vmlinuz fields report which kernel was selected; firmware identity may remain
+  unknown when no validated L1 identity is available.
   A readable but unsupported or malformed image has status: partial and a
-  stable unsupported-stage value; that is a successful inspection.
+  stable unsupported-stage value; that is a successful inspection. A complete
+  report recognises the main rootfs; it does not extract or validate nested
+  archives. Use decrypt --boot-only to obtain boot files for further analysis.
 
 EXIT CODES
   0  readable input was described, including status: partial
@@ -125,7 +135,7 @@ EXIT CODES
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return usagef("usage: fortitool inspect <image.out>")
+		return usagef("usage: fortitool inspect <image.out|disk.qcow2|image.zip>")
 	}
 
 	raw, err := os.ReadFile(fs.Arg(0))
@@ -143,40 +153,29 @@ EXIT CODES
 	report.inputSize = fmt.Sprintf("%d bytes", len(raw))
 	report.lastStage = inspectStageInput
 
-	image, wasGzip, err := decodeOuter(raw)
+	image, wrapper, err := decodeFirmwareContainer(raw)
+	report.outerWrapper = wrapper
+	outerStage := inspectStageOuterGzip
+	if wrapper == "zip" {
+		outerStage = inspectStageOuterZIP
+	}
 	if err != nil {
-		report.stop(inspectStageInput, inspectStageOuterGzip, err)
+		report.stop(inspectStageInput, outerStage, err)
 		report.print()
 		return nil
 	}
-	if wasGzip {
-		report.outerWrapper = "gzip"
-	} else {
-		report.outerWrapper = "none"
-	}
-	report.lastStage = inspectStageOuterGzip
-
-	plain, _, wasEncrypted, ok := l1.DecryptAuto(ctx, image)
-	if !ok {
-		report.stop(inspectStageOuterGzip, inspectStageL1, errors.New("no valid L1 header or key found"))
+	report.lastStage = outerStage
+	layer, err := decodeFirmwareLayer(ctx, image)
+	if err != nil {
+		report.stop(outerStage, inspectStageL1, err)
 		report.print()
 		return nil
 	}
-	header, ok := l1.FindHeader(plain)
-	if !ok {
-		report.stop(inspectStageOuterGzip, inspectStageL1, errors.New("decoded image has no validated L1 header"))
-		report.print()
-		return nil
-	}
-	report.firmwareIdentity = header.Identity
-	if wasEncrypted {
-		report.l1State = "encrypted"
-	} else {
-		report.l1State = "cleartext"
-	}
+	report.firmwareIdentity = layer.Identity
+	report.l1State = layer.State
 	report.lastStage = inspectStageL1
 
-	selection, err := openVolume(plain)
+	selection, err := openVolume(layer.Image)
 	if err != nil {
 		report.stop(inspectStageL1, inspectStageVolume, err)
 		report.print()
@@ -194,7 +193,7 @@ EXIT CODES
 	}
 	report.lastStage = inspectStageRequiredMembers
 
-	crypto, err := decideRootfsCrypto(ctx, selection.RequiredMembers.Flatkc.Data, selection.RequiredMembers.RootfsGz.Data)
+	crypto, err := decideRootfsCrypto(ctx, selection.RequiredMembers.Kernel.Data, selection.RequiredMembers.RootfsGz.Data)
 	if err != nil {
 		report.stop(inspectStageRequiredMembers, inspectStageRootfsCrypto, err)
 		report.print()
@@ -221,7 +220,15 @@ func (r *inspectReport) setRootfsCrypto(decision *rootfsDecision) {
 }
 
 func (r *inspectReport) setRequiredMembers(decision requiredMembersDecision) {
-	r.flatkc = decision.Flatkc.reportValue()
+	r.flatkc, r.vmlinuz = "absent", "absent"
+	if decision.Kernel.Name == "vmlinuz" {
+		r.vmlinuz = decision.Kernel.reportValue()
+	} else {
+		r.flatkc = decision.Kernel.reportValue()
+		if decision.Kernel.Name == "flatkc" {
+			r.vmlinuz = "not checked"
+		}
+	}
 	r.rootfsGz = decision.RootfsGz.reportValue()
 }
 

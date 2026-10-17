@@ -340,3 +340,20 @@ func readTestXZVLI(data []byte, pos *int) (uint64, error) {
 	}
 	return 0, io.ErrUnexpectedEOF
 }
+
+func TestXZDecompressBoundsAndTrailer(t *testing.T) {
+	plain := bytes.Repeat([]byte("bounded XZ payload"), 100)
+	compressed := buildTestXZ(t, xz.WriterConfig{CheckSum: xz.CRC64}, plain)
+	got, err := xzDecompress(compressed, int64(len(plain)))
+	if err != nil || !bytes.Equal(got, plain) {
+		t.Fatalf("exact limit: %v", err)
+	}
+	for _, limit := range []int64{0, int64(len(plain) - 1)} {
+		if _, err := xzDecompress(compressed, limit); err == nil {
+			t.Fatalf("accepted limit %d", limit)
+		}
+	}
+	if _, err := xzDecompress(compressed[:len(compressed)-4], int64(len(plain))); err == nil {
+		t.Fatal("truncated XZ trailer accepted at exact limit")
+	}
+}
