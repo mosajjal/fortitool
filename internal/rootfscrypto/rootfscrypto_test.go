@@ -1005,6 +1005,38 @@ func TestDecryptRootfs_ChaCha20Body(t *testing.T) {
 	}
 }
 
+// Reproduces the >= 7.4.8 failure from #28: the kernel carries XOR-family
+// candidates that parse as RSA keys but none decrypt the rootfs, while the
+// real key is reachable only through the ChaCha family. The pipeline must
+// fall back to a ChaCha scan after every XOR candidate fails body
+// validation instead of reporting no valid candidate (#29).
+func TestDecryptRootfsFallsBackToChaChaWhenXORCandidatesInvalid(t *testing.T) {
+	decoyKey := genTestRSAKey(t)
+	realKey := genTestRSAKey(t)
+
+	kernel := make([]byte, 4096)
+	if _, err := rand.Read(kernel); err != nil {
+		t.Fatal(err)
+	}
+	// Structurally valid XOR candidate whose key does not sign the rootfs.
+	embedXORCandidate(t, kernel, 256, decoyKey)
+	// The real key, obfuscated with a split the body derivation does not use.
+	embedChaChaCandidate(t, kernel, 1024, 2048, realKey, [2]int{2, 3})
+
+	rootfs, wantPlaintext := buildModifiedRC4Rootfs(t, realKey)
+
+	res, err := DecryptRootfs(context.Background(), kernel, rootfs)
+	if err != nil {
+		t.Fatalf("DecryptRootfs: %v", err)
+	}
+	if res.Seed.Family != "chacha20" {
+		t.Fatalf("family = %q, want chacha20", res.Seed.Family)
+	}
+	if !bytes.Equal(res.Plaintext, wantPlaintext) {
+		t.Fatal("fell back to the wrong candidate")
+	}
+}
+
 func TestDecryptRootfsSelectsSignatureMatchingCandidate(t *testing.T) {
 	wrong := genTestRSAKey(t)
 	correct := genTestRSAKey(t)
