@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -149,7 +150,7 @@ func TestCmdPkgScanRegularFilesAndSuggestion(t *testing.T) {
 		"Scanned 3 regular files",
 		"== ELF (1) ==",
 		"== PKCS#7 SignedData (1) ==",
-		"fortitool pkg inspect --content " + quoteCommandArgument(filepath.Join(root, "component")) + " " + quoteCommandArgument(filepath.Join(root, "component.x")),
+		pkgInspectSuggestion(runtime.GOOS, filepath.Join(root, "component"), filepath.Join(root, "component.x")),
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout does not contain %q:\n%s", want, stdout)
@@ -160,6 +161,9 @@ func TestCmdPkgScanRegularFilesAndSuggestion(t *testing.T) {
 func TestCmdPkgScanOmitsSuggestionForControlPaths(t *testing.T) {
 	root := t.TempDir()
 	payloadName := "component $(echo unsafe) \x1b\u202e'payload"
+	if runtime.GOOS == "windows" {
+		payloadName = "component $(echo unsafe) \u202e'payload"
+	}
 	signatureName := payloadName + ".x"
 	payload := []byte("synthetic package payload")
 	certDER, privateKey := buildPackageTestCertificate(t)
@@ -185,7 +189,7 @@ func TestCmdPkgScanOmitsSuggestionForControlPaths(t *testing.T) {
 	}
 }
 
-func TestCmdPkgScanQuotesPrintableShellMetacharacters(t *testing.T) {
+func TestCmdPkgScanHandlesPrintableShellMetacharacters(t *testing.T) {
 	root := t.TempDir()
 	payloadName := "component $(echo unsafe) 'payload"
 	signatureName := payloadName + ".x"
@@ -201,7 +205,7 @@ func TestCmdPkgScanQuotesPrintableShellMetacharacters(t *testing.T) {
 	}
 	contentPath := filepath.Join(root, payloadName)
 	signaturePath := filepath.Join(root, signatureName)
-	want := "fortitool pkg inspect --content " + quoteCommandArgument(contentPath) + " " + quoteCommandArgument(signaturePath)
+	want := pkgInspectSuggestion(runtime.GOOS, contentPath, signaturePath)
 	if !strings.Contains(stdout, want) {
 		t.Fatalf("stdout does not contain safely quoted rooted suggestion %q:\n%s", want, stdout)
 	}

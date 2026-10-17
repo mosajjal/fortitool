@@ -107,7 +107,7 @@ func TestExtractGzipTar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if link != "a/hello.txt" {
+	if link != filepath.FromSlash("a/hello.txt") {
 		t.Fatalf("symlink target = %q", link)
 	}
 }
