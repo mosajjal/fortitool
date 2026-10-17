@@ -12,61 +12,72 @@ import (
 
 	"github.com/mosajjal/fortitool/internal/archive"
 	"github.com/mosajjal/fortitool/internal/diskimage"
-	"github.com/mosajjal/fortitool/internal/l1"
 	"github.com/mosajjal/fortitool/internal/qcow2"
 )
 
 // nestedTarXZMembers are the tar+xz archives FortiOS nests inside the outer
-// rootfs tar; each is extracted into its own subdirectory named after it.
+// rootfs tar. FortiGate images merge them into the base rootfs.
 var nestedTarXZMembers = []string{"bin.tar.xz", "usr.tar.xz", "migadmin.tar.xz", "node-scripts.tar.xz"}
 
 func cmdDecrypt(ctx context.Context, args []string) error {
 	fs := newCommandFlagSet("decrypt", nil)
 	outDir := fs.String("o", "", "output directory (required)")
 	showKeys := fs.Bool("show-keys", false, "print recovered key material")
+	bootOnly := fs.Bool("boot-only", false, "extract the boot filesystem without decoding rootfs")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `fortitool decrypt -- full pipeline: raw .out -> unpacked rootfs, one command
+		fmt.Fprint(os.Stderr, `fortitool decrypt -- extract FortiOS firmware or FAZ/FMG KVM installation disks
 
-Runs the whole chain in order, auto-detecting the crypto era at each
-layer (no version/model/architecture flag needed):
-  1. gunzip the outer .out wrapper
-  2. L1 XOR decrypt (known-plaintext attack, or detect already-cleartext)
-  3. locate the FORTIOS volume -- appliance images (MBR + ext3 @512),
-     VM/KVM images (qcow2 disk with partitioned ext filesystems), and
-     fixed-offset layouts (e.g. FortiManager @0x400000) are all handled,
-     pure Go, no mount/debugfs/7z
-  4. locate flatkc + rootfs.gz, extract datafs.tar.gz/devicetree.dtb/etc
-     alongside them if present
-  5. decrypt rootfs.gz (any known FortiOS 7.4.x-8.0 scheme)
-  6. unpack the rootfs payload -- gzip tar (<=7.6) or xz-compressed ext4
-     filesystem image (8.0 VM) -- then merge in any nested bin.tar.xz/
-     usr.tar.xz/migadmin.tar.xz/node-scripts.tar.xz members, then unpack
-     datafs.tar.gz if present
+Accepts raw .out firmware, bare QCOW2 disks, and ZIP packages containing
+exactly one regular QCOW2 file (at most 2 GiB expanded). Formats are detected
+from their contents; no version, model or architecture flag is needed.
+
+The full pipeline unwraps gzip or ZIP, validates L1 for non-QCOW2 input,
+finds the boot filesystem and its flatkc or vmlinuz kernel plus rootfs.gz, decrypts
+supported rootfs schemes, and extracts gzip tar/CPIO or XZ CPIO/ext payloads.
+
+FortiGate nested archives are merged into rootfs/. For vmlinuz boot layouts
+(FAZ/FMG), nested and additional boot archives are extracted as separate
+layers: the bootstrap and application archives can have different files at
+the same path. Originals are retained; no boot-time overlay order is assumed.
 
 USAGE
-  fortitool decrypt -o OUTDIR <image.out>
+  fortitool decrypt [--boot-only] -o OUTDIR <image.out|disk.qcow2|image.zip>
 
 FLAGS
-  -o OUTDIR     output directory (required) -- must not already exist;
-                published only on success, private to the invoking identity
-                (mode 0700 on Unix; protected per-user DACL on Windows)
+  -o OUTDIR     required; must not exist. Output is published only on success,
+                private to the invoking identity (0700 on Unix; protected
+                per-user DACL on Windows).
+  --boot-only   extract readable directories, regular files and symlinks from
+                the selected boot filesystem. Unreadable entries and special
+                files (such as device/FIFO nodes) are skipped; success does not
+                certify a complete copy. Rootfs and additional archives stay
+                encoded. Use 'unpack' on readable additional archives.
   --show-keys   print recovered key material (redacted by default)
 
-EXAMPLE
+EXAMPLES
   fortitool decrypt -o work/v7411 FWF_60E-v7.4.11-build2878-FORTINET.out
+  fortitool decrypt -o work/fmg FMG_VM64_KVM-v7.0.16-build0710-FORTINET.out.kvm.zip
+  fortitool decrypt --boot-only -o work/boot faz.qcow2
+  fortitool unpack -o work/extensions work/boot/rootfs-ext.tar.xz
 
-OUTPUT LAYOUT (under OUTDIR)
-  flatkc, rootfs.gz.dec, datafs.tar.gz, devicetree.dtb, ...  (raw extracted files)
-  rootfs/                                                    (unpacked rootfs tree)
-  rootfs/bin/init                                            (the FortiOS monolith,
-                                                                if bin.tar.xz was present)
-  datafs/                                                     (unpacked datafs.tar.gz,
-                                                                if present)
+OUTPUT LAYOUT (full pipeline)
+  flatkc or vmlinuz, rootfs.gz.dec, ...    kernel, decoded rootfs and extras
+  rootfs/                                base root filesystem
+  datafs/                                unpacked datafs.tar.gz, if present
+  layers/rootfs/<archive-name>/           FAZ/FMG nested archives, if present
+  layers/boot/<archive-name>/             FAZ/FMG boot archives, if present
+
+For example, the base rootfs/bin/init and the application file
+layers/rootfs/bin.tar.xz/bin/init are both retained. Layers are for static
+analysis, not a reconstructed bootable filesystem.
+
+FAZ/FMG support includes plain gzip/XZ CPIO and protected x86-64 vmlinuz
+with AES-128-CTR rootfs. See the README for the tested KVM builds. Upgrade
+.out packages and hardware-appliance images need separate validation.
 
 EXIT CODES
-  0  full pipeline succeeded
-  1  failed at some stage -- stdout shows which step ([1/6]..[6/6]) and
-     the error indicates why (wrong file, unsupported crypto era, etc.)
+  0  requested full pipeline or explicit boot-only extraction succeeded
+  1  failed; no output directory is published
   2  invalid flags, missing -o, or wrong number of positional arguments
 `)
 	}
@@ -78,7 +89,7 @@ EXIT CODES
 	}
 	if fs.NArg() != 1 || *outDir == "" {
 		fs.Usage()
-		return usagef("usage: fortitool decrypt -o OUTDIR <image.out>")
+		return usagef("usage: fortitool decrypt [--boot-only] -o OUTDIR <image>")
 	}
 	inPath := fs.Arg(0)
 	staged, err := newStagedOutputDir(*outDir)
@@ -92,25 +103,25 @@ EXIT CODES
 	if err != nil {
 		return err
 	}
-	img, err := gunzipOuter(raw)
+	img, _, err := decodeFirmwareContainer(raw)
 	if err != nil {
-		return fmt.Errorf("outer gunzip: %w", err)
+		return fmt.Errorf("outer container: %w", err)
 	}
 	fmt.Printf("      %d bytes\n", len(img))
 
 	fmt.Println("[2/6] L1 outer-layer decryption")
-	plain, key, wasEncrypted, ok := l1.DecryptAuto(ctx, img)
-	if !ok {
-		return fmt.Errorf("no valid L1 key found")
+	layer, err := decodeFirmwareLayer(ctx, img)
+	if err != nil {
+		return err
 	}
-	if wasEncrypted {
-		fmt.Printf("      %s\n", formatRecoveredKey(key, *showKeys))
+	if layer.State == "encrypted" {
+		fmt.Printf("      %s\n", formatRecoveredKey(layer.Key, *showKeys))
 	} else {
-		fmt.Println("      already cleartext")
+		fmt.Printf("      %s\n", layer.State)
 	}
 
-	fmt.Println("[3/6] locating the FORTIOS volume")
-	selection, err := openVolume(plain)
+	fmt.Println("[3/6] locating the firmware boot volume")
+	selection, err := openVolume(layer.Image)
 	if err != nil {
 		return fmt.Errorf("volume discovery: %w", err)
 	}
@@ -119,13 +130,28 @@ EXIT CODES
 		return err
 	}
 	volume := selection.Volume
-	flatkc := selection.RequiredMembers.Flatkc.Data
+	if *bootOnly {
+		if err := volume.ExtractAll(staged.temp); err != nil {
+			return fmt.Errorf("boot filesystem: %w", err)
+		}
+		if err := staged.Commit(); err != nil {
+			return err
+		}
+		fmt.Printf("\n[+] DONE: boot files extracted under %s; rootfs was not decrypted or unpacked\n", terminalText(*outDir))
+		return nil
+	}
+	flatkc := selection.RequiredMembers.Kernel.Data
 	rootfsGz := selection.RequiredMembers.RootfsGz.Data
-	if err := os.WriteFile(filepath.Join(staged.temp, "flatkc"), flatkc, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staged.temp, selection.RequiredMembers.Kernel.Name), flatkc, 0o644); err != nil {
 		return err
 	}
 
-	for _, extra := range []string{"datafs.tar.gz", "devicetree.dtb", "filechecksum", "hash_bin.sha256", "split_rootfs.tar.xz", ".db"} {
+	extras := []string{"datafs.tar.gz", "devicetree.dtb", "filechecksum", "hash_bin.sha256", "split_rootfs.tar.xz", ".db"}
+	layered := selection.RequiredMembers.Kernel.Name == "vmlinuz"
+	if layered {
+		extras = append(extras, bootArchiveMembers...)
+	}
+	for _, extra := range extras {
 		data, err := readOptionalMember(volume, extra)
 		if err != nil {
 			return fmt.Errorf("reading %s: %w", extra, err)
@@ -154,8 +180,17 @@ EXIT CODES
 	}
 
 	fmt.Println("[6/6] unpacking nested tar+xz members")
-	if err := extractNestedMembers(rootfsDir); err != nil {
-		return err
+	if layered {
+		if err := extractArchiveLayers(rootfsDir, filepath.Join(staged.temp, "layers", "rootfs"), append([]string{"lib.tar.xz"}, nestedTarXZMembers...)); err != nil {
+			return err
+		}
+		if err := extractArchiveLayers(staged.temp, filepath.Join(staged.temp, "layers", "boot"), bootArchiveMembers); err != nil {
+			return err
+		}
+	} else {
+		if err := extractNestedMembers(rootfsDir); err != nil {
+			return err
+		}
 	}
 
 	if extracted, err := extractDatafs(staged.temp); err != nil {
@@ -171,7 +206,7 @@ EXIT CODES
 	if err := staged.Commit(); err != nil {
 		return err
 	}
-	if initSize >= 0 {
+	if initSize >= 0 && !layered {
 		fmt.Printf("\n[+] DONE: %s (%d bytes)\n", terminalText(filepath.Join(*outDir, "rootfs", "bin", "init")), initSize)
 	} else {
 		fmt.Printf("\n[+] DONE: unpacked under %s\n", terminalText(*outDir))
@@ -233,16 +268,15 @@ func extractDatafs(outputDir string) (bool, error) {
 // openVolume locates a readable ext filesystem inside a decrypted firmware
 // image, handling every known on-disk layout:
 //
-//   - qcow2 VM disks (FortiGate/FortiManager VM .out payloads): the guest
+//   - qcow2 VM disks: the guest
 //     disk is exposed read-only via internal/qcow2, then scanned for ext
 //     volumes exactly like a raw disk;
 //   - raw disks with an MBR partition table (appliance images keep their
 //     ext3 volume at sector 1; VM boot disks carry several partitions);
-//   - fixed-offset layouts with no partition table (some FortiManager
-//     images start their volume at 0x400000).
+//   - fixed-offset layouts with no partition table.
 //
 // When several candidate volumes exist (partitioned VM disks), the one
-// actually containing flatkc + rootfs.gz wins.
+// actually containing a kernel (flatkc or vmlinuz) and rootfs.gz wins.
 type volumeSelection struct {
 	Volume          *diskimage.FS
 	DiskLayout      string
@@ -262,15 +296,19 @@ type memberDecision struct {
 }
 
 type requiredMembersDecision struct {
-	Flatkc   memberDecision
+	Kernel   memberDecision
 	RootfsGz memberDecision
 }
 
 func readRequiredMembers(volume volumeFileReader) requiredMembersDecision {
-	return requiredMembersDecision{
-		Flatkc:   readMember(volume, "flatkc"),
-		RootfsGz: readMember(volume, "rootfs.gz"),
+	kernel := readMember(volume, "flatkc")
+	if errors.Is(kernel.Err, diskimage.ErrNotFound) {
+		kernel = readMember(volume, "vmlinuz")
+		if errors.Is(kernel.Err, diskimage.ErrNotFound) {
+			kernel.Name = "flatkc or vmlinuz"
+		}
 	}
+	return requiredMembersDecision{Kernel: kernel, RootfsGz: readMember(volume, "rootfs.gz")}
 }
 
 func readMember(volume volumeFileReader, name string) memberDecision {
@@ -280,7 +318,7 @@ func readMember(volume volumeFileReader, name string) memberDecision {
 
 func (d requiredMembersDecision) Err() error {
 	var missing []string
-	for _, member := range []memberDecision{d.Flatkc, d.RootfsGz} {
+	for _, member := range []memberDecision{d.Kernel, d.RootfsGz} {
 		switch {
 		case member.Err == nil:
 		case errors.Is(member.Err, diskimage.ErrNotFound):
@@ -377,14 +415,13 @@ func diskLayoutForLocation(containerLayout string, location diskimage.Filesystem
 	}
 }
 
-// extractRootfsPayload unpacks a decrypted rootfs body. Two container
-// shapes exist across the product line:
+// extractRootfsPayload unpacks a decrypted rootfs body:
 //
 //   - gzip-compressed GNU tar or newc CPIO: classified from the decompressed
 //     stream and extracted directly. Skips classifyRootfsPayload, which would
 //     inflate the whole archive once more just to learn the container kind;
-//   - xz-compressed ext4 filesystem image (8.0 VM builds): decompressed,
-//     then dumped file-by-file through the pure-Go ext reader.
+//   - XZ-compressed newc CPIO or ext filesystem: decompressed, classified,
+//     and extracted through the existing archive or filesystem reader.
 func extractRootfsPayload(plain []byte, destDir string) error {
 	if len(plain) >= 2 && plain[0] == 0x1f && plain[1] == 0x8b {
 		return archive.ExtractGzipRootfs(plain, destDir)
@@ -396,6 +433,8 @@ func extractRootfsPayload(plain []byte, destDir string) error {
 	switch decision.Kind {
 	case "xz/ext":
 		return decision.ext.ExtractAll(destDir)
+	case "xz/newc":
+		return archive.ExtractNewc(bytes.NewReader(decision.newc), destDir)
 	default:
 		return fmt.Errorf("unsupported rootfs payload kind %q", decision.Kind)
 	}
@@ -404,6 +443,7 @@ func extractRootfsPayload(plain []byte, destDir string) error {
 type rootfsPayloadDecision struct {
 	Kind string
 	ext  *diskimage.FS
+	newc []byte
 }
 
 func classifyRootfsPayload(plain []byte) (*rootfsPayloadDecision, error) {
@@ -418,6 +458,12 @@ func classifyRootfsPayload(plain []byte) (*rootfsPayloadDecision, error) {
 		raw, err := archive.XZDecompress(plain)
 		if err != nil {
 			return nil, fmt.Errorf("xz decompress: %w", err)
+		}
+		if bytes.HasPrefix(raw, []byte("070701")) || bytes.HasPrefix(raw, []byte("070702")) {
+			if err := archive.ValidateNewc(bytes.NewReader(raw)); err != nil {
+				return nil, err
+			}
+			return &rootfsPayloadDecision{Kind: "xz/newc", newc: raw}, nil
 		}
 		vol, err := diskimage.Open(raw)
 		if err != nil {

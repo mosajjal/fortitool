@@ -1,8 +1,9 @@
 # fortitool
 
-Single static Go binary/library that decrypts and unpacks FortiOS firmware
-end-to-end. See README.md for the full pitch, supported-firmware table, and
-acknowledgments. This file is for working on the code itself.
+Single static Go binary/library that decrypts and unpacks FortiGate/FortiWiFi
+FortiOS firmware and supported FortiAnalyzer/FortiManager KVM installation
+packages. See README.md for exact coverage and acknowledgments. This file is
+for working on the code itself.
 
 ## Build / test
 
@@ -16,16 +17,17 @@ gofmt -l .   # must be empty
 Always run all four before considering a change done. `CGO_ENABLED=0`
 matters: without it the binary links dynamically against glibc and breaks
 the "no OS packages at runtime" promise this whole project exists for.
+See `CONTRIBUTING.md` for the required race and Linux/386 checks.
 
 ## Architecture
 
 ```
 internal/l1            outer .out XOR cipher (known-plaintext attack)
-internal/kernelpayload  flatkc -> decompressed kernel bytes
-internal/rootfscrypto   seed/RSA-key scanner + all rootfs.gz body ciphers
+internal/kernelpayload  flatkc / protected x86-64 vmlinuz -> kernel bytes
+internal/rootfscrypto   seed/RSA and static-material scanners + rootfs ciphers
 internal/qcow2          read-only qcow2 (VM disk) reader
 internal/diskimage      read-only ext2/ext3/ext4 (MBR-stripped partition -> files)
-internal/archive        tar/gzip/xz unpacking (stdlib + pure-Go xz)
+internal/archive        tar/newc CPIO, gzip/xz unpacking (stdlib + pure-Go xz)
 internal/pkcs7          PKCS#7 SignedData parse + detached-signature verify
 internal/configsecret   config-backup ENC secret decrypt
 cmd/fortitool           CLI wiring
@@ -47,7 +49,7 @@ commit message or the README's coverage table, not in `go test`.
   in English is not.
 - When a crypto/format detail was ported from prior public research
   (BishopFox/forticrack, hacefresko/forticrack_v8, hackintoanetwork/fgx,
-  noways-io/fortigate-crypto, RandoriSec, gquere/CVE-2019-6693), credit it
+  noways-io/fortigate-crypto, RandoriSec, Rapid7, gquere/CVE-2019-6693), credit it
   inline where the algorithm lives, not just in the README. See existing
   doc comments in `internal/l1`, `internal/rootfscrypto`, and
   `internal/configsecret` for the pattern.
@@ -60,8 +62,10 @@ commit message or the README's coverage table, not in `go test`.
 - Prefer extending the auto-detection (the seed/RSA scanner in
   `internal/rootfscrypto`, the layout detection in `internal/configsecret`)
   over adding a version/model/architecture flag. The entire point of this
-  tool is that the user shouldn't have to know which FortiOS era they're
-  looking at.
+  tool is that the user shouldn't have to select the product or crypto era.
+- FAZ/FMG bootstrap and application archives can contain different files at
+  the same path. Preserve their separate output layers; keep FortiGate's
+  existing nested-archive merge behaviour and collision checks.
 
 ## Repo layout beyond the Go module
 

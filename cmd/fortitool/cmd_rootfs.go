@@ -33,47 +33,42 @@ func cmdRootfs(ctx context.Context, args []string) error {
 	out := fs.String("o", "rootfs.gz.dec", "output file")
 	showKeys := fs.Bool("show-keys", false, "print recovered key material")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `fortitool rootfs -- decrypt rootfs.gz, any known FortiOS era, auto-detected
+		fmt.Fprint(os.Stderr, `fortitool rootfs -- decrypt supported Fortinet rootfs.gz payloads, auto-detected
 
-Every FortiOS rootfs.gz crypto scheme from 7.4.1 through 8.0 hides a
-32-byte seed and a 270-byte obfuscated RSA public key somewhere in the
-kernel (flatkc), used to unwrap a per-image AES/RC4 key carried in
-rootfs.gz's own trailing 256-byte signature. This command scans for that
-material WITHOUT disassembly (no objdump/miasm/Ghidra needed) by
-exploiting that the recovered key always decrypts to a known ASN.1 DER
-prefix, covering two obfuscation families and picks whichever body cipher
-(AES-CTR / FORT-RC4 / modified-RC4) actually produces a valid gzip stream
--- no version or CPU architecture flag required.
+Finds the kernel's crypto material and selects a supported rootfs cipher
+without a version or architecture flag. FortiOS seed/RSA and static ChaCha20
+schemes use flatkc. Protected FAZ/FMG x86-64 vmlinuz kernels use a recovered
+XOR key and static AES-128-CTR material; their rootfs SHA-256 digest and
+complete XZ/CPIO archive must validate. No external disassembler is needed.
 
-Pre-7.4.1 images have NO rootfs encryption (plain gzip+cpio/tar); that
-case is detected and passed through unchanged.
+Plain gzip roots and supported XZ CPIO/ext roots are detected and passed
+through unchanged. FAZ/FMG roots use vmlinuz in place of flatkc.
 
 USAGE
-  fortitool rootfs [-o FILE] <flatkc> <rootfs.gz>
+  fortitool rootfs [-o FILE] <kernel> <rootfs.gz>
 
-  flatkc and rootfs.gz are the two files that live at the root of the
-  ext3 volume inside a decrypted (L1-layer) firmware image -- extract
-  them yourself, or use 'fortitool decrypt' for the full one-shot
-  pipeline starting from the raw .out file.
+  flatkc (or vmlinuz) and rootfs.gz live in the selected boot filesystem.
+  Use 'decrypt --boot-only' to obtain them, or 'decrypt' for the full
+  pipeline from a supported .out, QCOW2 or single-QCOW2 ZIP input.
 
 FLAGS
   -o FILE      output file (default: rootfs.gz.dec; must not exist)
   --show-keys  print recovered key material (redacted by default)
 
-EXAMPLE
+EXAMPLES
   fortitool rootfs -o rootfs.gz.dec fs/flatkc fs/rootfs.gz
+  fortitool rootfs -o rootfs.xz fs/vmlinuz fs/rootfs.gz
 
 OUTPUT
   Prints which crypto family/cipher matched and whether the embedded
   SHA-256 hash check passed, then writes the decrypted rootfs.gz (still
-  gzip-compressed tar -- pipe it to 'fortitool unpack' to extract it).
+  compressed; use 'decrypt' for automatic rootfs extraction).
   The standalone decrypted file is private to the invoking identity: mode 0600
   on Unix and a protected per-user DACL on Windows.
 
 EXIT CODES
-  0  decrypted (or was already plain gzip -- check stdout for which)
-  1  no seed/RSA-key material found, or none of the known body ciphers
-     produced valid output -- likely an unsupported crypto era
+  0  decrypted (or was already compressed plaintext -- check stdout for which)
+  1  input/output error, unsupported crypto or invalid rootfs payload
   2  invalid flags or wrong number of positional arguments
 `)
 	}
@@ -85,7 +80,7 @@ EXIT CODES
 	}
 	if fs.NArg() != 2 {
 		fs.Usage()
-		return usagef("usage: fortitool rootfs [-o FILE] <flatkc> <rootfs.gz>")
+		return usagef("usage: fortitool rootfs [-o FILE] <kernel> <rootfs.gz>")
 	}
 
 	flatkc, err := os.ReadFile(fs.Arg(0))
@@ -101,6 +96,12 @@ EXIT CODES
 	if err != nil {
 		return err
 	}
+	if bytes.HasPrefix(plain, []byte("\xfd7zXZ\x00")) {
+		if _, err := classifyRootfsPayload(plain); err != nil {
+			return err
+		}
+	}
+
 	if err := writeNewFile(*out, plain, 0o600); err != nil {
 		return err
 	}
@@ -108,18 +109,16 @@ EXIT CODES
 	return nil
 }
 
-// decryptRootfsAuto handles both encrypted (7.4.x+) and plain (<=7.4.0)
-// rootfs.gz: plain images are already valid gzip and need no crypto at all.
 func decryptRootfsAuto(ctx context.Context, flatkc, rootfsGz []byte, showKeys bool) ([]byte, error) {
 	decision, err := decideRootfsCrypto(ctx, flatkc, rootfsGz)
 	if err != nil {
 		return nil, err
 	}
 	if decision.AlreadyPlain {
-		fmt.Println("[+] rootfs.gz is already plain gzip (pre-7.4.1 image, no rootfs crypto)")
+		fmt.Println("[+] rootfs payload is already compressed plaintext (no rootfs crypto)")
 		return decision.Plaintext, nil
 	}
-	fmt.Printf("[*] kernel payload: %d bytes @ flatkc offset 0x%x\n", decision.KernelPayloadSize, decision.KernelPayloadOffset)
+	fmt.Printf("[*] kernel payload: %d bytes @ kernel image offset 0x%x\n", decision.KernelPayloadSize, decision.KernelPayloadOffset)
 	fmt.Printf("[+] seed family=%s cipher=%s hashOK=%v @ kernel offset 0x%x\n",
 		terminalText(decision.Family), terminalText(decision.Cipher), decision.HashOK, decision.SeedOffset)
 	fmt.Printf("    %s\n", formatRootfsKeyDetail(decision.keyDetail, showKeys))
@@ -136,9 +135,13 @@ func decideRootfsCrypto(ctx context.Context, flatkc, rootfsGz []byte) (*rootfsDe
 		}, nil
 	}
 
+	if bytes.HasPrefix(rootfsGz, []byte("\xfd7zXZ\x00")) {
+		return &rootfsDecision{Plaintext: rootfsGz, Family: "none", Cipher: "none", AlreadyPlain: true}, nil
+	}
+
 	payload, off, err := kernelpayload.Extract(flatkc)
 	if err != nil {
-		return nil, fmt.Errorf("extracting kernel payload from flatkc: %w", err)
+		return nil, fmt.Errorf("extracting kernel payload: %w", err)
 	}
 	res, err := rootfscrypto.DecryptRootfs(ctx, payload, rootfsGz)
 	if err != nil {

@@ -34,10 +34,10 @@ func plausibleBody(b []byte) bool {
 // Result carries everything the caller might want to log/verify about a
 // successful rootfs decryption.
 type Result struct {
-	Plaintext []byte // decrypted rootfs.gz (still gzip-compressed cpio)
+	Plaintext []byte // decrypted rootfs.gz (still compressed)
 	Seed      *SeedMaterial
 	Cipher    string // "aes-ctr" or "fort-rc4" or "modified-rc4"
-	HashOK    bool   // SHA-256(body) matched the value carried in the signature
+	HashOK    bool   // SHA-256 matched the format's stored digest; not publisher authentication
 	KeyDetail string
 }
 
@@ -46,6 +46,11 @@ type Result struct {
 // signature-envelope and body validation, then decrypt with the matching body
 // cipher.
 func DecryptRootfs(ctx context.Context, kernelPayload, rootfsGz []byte) (*Result, error) {
+	if bytes.HasPrefix(kernelPayload, []byte("\x7fELF")) {
+		if result, err := decryptStaticAESCTR(ctx, kernelPayload, rootfsGz); result != nil || err != nil {
+			return result, err
+		}
+	}
 	candidates := FindSeedMaterials(ctx, kernelPayload)
 	if err := ctx.Err(); err != nil {
 		return nil, err

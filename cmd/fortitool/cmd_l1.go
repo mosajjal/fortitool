@@ -49,13 +49,12 @@ func cmdL1(ctx context.Context, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `fortitool l1 -- decrypt the outer FortiOS ".out" firmware container
 
-Every FortiOS .out image (v6.x through 8.0, every product line) uses the
-same outer scheme: a 512-byte-block XOR chain with a 32-byte alphanumeric
-key that resets to IV=0xFF at every block boundary. This command recovers
-the key live via a known-plaintext attack (32 NUL bytes are known to sit at
-offset 48 of the cleartext header) and decrypts the whole image -- no fixed
-key list needed, no version/model argument needed. Some images ship
-already cleartext at this layer; that's detected and handled too.
+Supported FortiOS .out layouts use a 512-byte-block XOR chain and a
+32-byte alphanumeric key. The IV resets to 0xFF at each block boundary.
+This command recovers the key live via a known-plaintext attack (32 NUL
+bytes are known at offset 48 of the cleartext header), then decrypts the
+whole image. No fixed key list or version/model argument is needed. Some
+images ship cleartext at this layer; that is detected and handled too.
 
 Input is the RAW .out file as downloaded (still gzip-wrapped) -- this
 command gunzips it internally first.

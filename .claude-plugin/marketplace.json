@@ -1,6 +1,6 @@
 {
   "name": "fortitool",
-  "description": "FortiOS firmware decryption tooling by Ali Mosajjal - the fortitool CLI/skill for decrypting and unpacking FortiOS firmware end-to-end.",
+  "description": "Fortinet firmware tooling by Ali Mosajjal - fortitool for supported FortiGate/FortiWiFi firmware and FortiAnalyzer/FortiManager KVM installation packages.",
   "owner": {
     "name": "Ali Mosajjal",
     "url": "https://github.com/mosajjal"
@@ -9,14 +9,14 @@
     {
       "name": "fortitool",
       "source": "./plugin",
-      "description": "Decrypt and unpack FortiOS firmware end-to-end - outer cipher, every known rootfs.gz crypto scheme auto-detected, ext3, tar/xz, PKCS#7 signatures, config secrets. One static Go binary, no OS deps.",
+      "description": "Decrypt and unpack supported FortiGate/FortiWiFi firmware and FAZ/FMG KVM disks, with automatic format/crypto detection. Also inspect FortiGuard PKCS#7 signatures and decrypt FortiOS config secrets. One static Go binary, no runtime OS packages.",
       "version": "0.1.0",
       "license": "MIT",
       "author": {
         "name": "Ali Mosajjal",
         "url": "https://github.com/mosajjal"
       },
-      "keywords": ["fortios", "fortigate", "firmware", "security-research"]
+      "keywords": ["fortios", "fortigate", "fortianalyzer", "fortimanager", "firmware", "security-research"]
     }
   ]
 }

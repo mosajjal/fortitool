@@ -1,6 +1,6 @@
 ---
 name: fortios-firmware
-description: Decrypt and unpack Fortinet FortiOS firmware images and config-backup secrets using the fortitool CLI (github.com/mosajjal/fortitool). Use when the user has a FortiGate/FortiWiFi ".out" firmware image and wants it decrypted/unpacked, needs to extract or read flatkc/rootfs.gz/the ext3 volume from FortiOS firmware, wants to verify a FortiGuard PKCS#7 ".x" signature or inspect a datafs directory, or wants to decrypt a `set <field> ENC <base64>` secret from a FortiOS config backup.
+description: Decrypt and unpack supported Fortinet firmware using the fortitool CLI (github.com/mosajjal/fortitool). Use for FortiGate/FortiWiFi ".out" firmware or FortiAnalyzer/FortiManager KVM QCOW2 and single-disk ZIP packages; extracting flatkc, vmlinuz, rootfs.gz or the boot filesystem; inspecting FortiGuard PKCS#7 ".x" signatures or datafs files; or decrypting `set <field> ENC <base64>` secrets from FortiOS config backups.
 ---
 
 Only ever run this against firmware or config backups the user owns or is
@@ -25,10 +25,11 @@ or build from source (`git clone https://github.com/mosajjal/fortitool && cd for
 
 | Command | Does |
 |---|---|
-| `fortitool decrypt -o OUTDIR image.out` | Full pipeline: raw `.out` -> unpacked rootfs, one shot. Try this first for a firmware image. |
-| `fortitool inspect image.out` | Describe one image and its last recognised stage without extracting files or showing keys |
+| `fortitool decrypt -o OUTDIR image` | Full extraction of supported `.out`, QCOW2 or single-QCOW2 ZIP inputs |
+| `fortitool decrypt --boot-only -o OUTDIR image` | Extract readable boot files, preserving encoded rootfs and additional archives; skips unreadable entries and special files |
+| `fortitool inspect image` | Describe one image and its last recognised stage without extracting files or showing keys |
 | `fortitool l1 -o out.img image.out` | Outer XOR layer only |
-| `fortitool rootfs -o out.gz flatkc rootfs.gz` | rootfs.gz crypto layer only |
+| `fortitool rootfs -o out.gz kernel rootfs.gz` | rootfs.gz crypto layer using flatkc or vmlinuz |
 | `fortitool unpack -o outdir archive` | Generic tar / gzip+tar / xz+tar extraction |
 | `fortitool pkg scan datafs/` | Classify files in a directory, find PKCS#7 signatures |
 | `fortitool pkg inspect --content payload sig.x` | Verify every signer in a detached PKCS#7 signature (integrity only; no trust-chain validation) |
@@ -50,9 +51,19 @@ parser doesn't permute argv).
   image exits 0 with `status: partial`, `last-successful-stage` and
   `unsupported-stage`; absent or inaccessible input exits 1. It has no
   `--show-keys`, output-directory, JSON or batch option.
+- The 24 tested FAZ/FMG KVM packages support full extraction, including
+  protected kernels and AES-128-CTR rootfs in 7.2.12, 7.4.11, 7.6.7 and
+  8.0.1. See the README for exact builds. This does not establish support
+  for FAZ/FMG upgrade `.out` packages or hardware-appliance images.
+- FAZ/FMG output retains base files in `rootfs/` and extracts archives into
+  `layers/rootfs/<archive-name>/` and `layers/boot/<archive-name>/`. Different
+  versions of the same path are preserved; do not assume a merged bootable
+  filesystem or that the base `bin/init` is the application binary.
 - `decrypt` discovers supported ext filesystems in raw MBR-partitioned,
   qcow2, and fixed-offset disk layouts. Its output directory must not already
-  exist and is published only after the complete pipeline succeeds.
+  exist and is published only after the requested extraction succeeds.
+  `--boot-only` skips rootfs decoding and archive expansion; unreadable entries
+  and special files are skipped, so it does not certify a complete copy.
 - `config decrypt` auto-detects and handles both known key eras (legacy,
   through FortiOS 7.2.3, and >=7.4/build 2731) -- no flags needed. If it
   still reports an unrecognized format, the field's blob layout isn't one

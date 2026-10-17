@@ -1,6 +1,5 @@
 // Package kernelpayload extracts the decompressed kernel image embedded in
-// a Fortinet flatkc container, replacing the `gunzip` subprocess call every
-// reference tool (forticrack_v8, fgx) shells out for.
+// a Fortinet flatkc container or a supported protected x86-64 vmlinuz image.
 package kernelpayload
 
 import (
@@ -20,6 +19,8 @@ const (
 // and decompresses it, returning the member whose decompressed size looks
 // kernel-sized (>1MB) -- flatkc containers can carry more than one gzip
 // member (bootstrap stub, compressed kernel, ...).
+// Protected bzImage kernels require a complete gzip member and a bounded
+// x86-64 ELF image after recovering the stub's XOR material.
 func Extract(flatkc []byte) (payload []byte, gzipOffset int, err error) {
 	return extract(flatkc, maxKernelPayloadSize)
 }
@@ -54,8 +55,11 @@ func extract(flatkc []byte, maxExpanded int64) (payload []byte, gzipOffset int, 
 		}
 		off = off + magicScanStep + next
 	}
-	if candidateErr != nil {
-		return nil, 0, fmt.Errorf("no complete kernel-sized gzip member found in flatkc: %w", candidateErr)
+	if payload, off := extractProtectedBZImage(flatkc, maxExpanded); payload != nil {
+		return payload, off, nil
 	}
-	return nil, 0, errors.New("no complete kernel-sized gzip member found in flatkc")
+	if candidateErr != nil {
+		return nil, 0, fmt.Errorf("no complete kernel-sized gzip member found in kernel image: %w", candidateErr)
+	}
+	return nil, 0, errors.New("no complete kernel-sized gzip member found in kernel image")
 }

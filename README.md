@@ -1,12 +1,16 @@
 # fortitool
 
-A single static Go binary that decrypts and unpacks Fortinet FortiOS
-firmware end to end — no `openssl`, `xz`, `tar`, `cpio`, `mount`/`debugfs`,
-`7z`, `binwalk`, `vmlinux-to-elf`, or Python at runtime. Every format
-(gzip, tar, xz, ext2/3, ASN.1/PKCS#7) and every crypto layer FortiOS has
-shipped (the outer XOR cipher, ChaCha20+RSA+AES-CTR, XOR+RSA+FORT-RC4,
-modified-RC4, legacy config-secret AES-CBC) is implemented in Go and
-auto-detected — no version, model, or CPU architecture flag needed.
+A single static Go binary and library for decrypting and unpacking Fortinet
+firmware: FortiGate/FortiWiFi FortiOS images and tested FortiAnalyzer/FortiManager
+KVM installation packages. Supported containers, filesystems and crypto
+schemes are detected from their contents, without a product, version or CPU
+architecture flag. See [Supported firmware](#supported-firmware) for the
+tested products, package types and stages.
+
+The format and crypto readers are implemented in Go. No `openssl`, `xz`,
+`tar`, `cpio`, `mount`/`debugfs`, `7z`, `binwalk`, `vmlinux-to-elf`, or Python
+is required at runtime. FortiOS config-secret decryption and FortiGuard
+PKCS#7 signature inspection are also included.
 
 Historically, decrypting one firmware image meant picking the right tool
 out of several version-specific ones (`forticrack`, `fgx`, `forticrack_v8`,
@@ -45,8 +49,10 @@ resolver. Verify with `file fortitool` (should say "statically linked") or
 ```sh
 fortitool decrypt -o outdir image.out          # full pipeline, one command
 fortitool inspect image.out                    # read-only format/support report
+fortitool decrypt -o fmg image.out.kvm.zip     # FAZ/FMG single-QCOW2 package
+fortitool decrypt --boot-only -o boot faz.qcow2 # original boot files only
 fortitool l1 -o out.img image.out              # outer XOR layer only
-fortitool rootfs -o out.gz flatkc rootfs.gz    # rootfs crypto layer only
+fortitool rootfs -o out.gz kernel rootfs.gz    # kernel is flatkc or vmlinuz
 fortitool unpack -o outdir archive.tar.xz      # generic gzip+tar / xz+tar
 fortitool pkg inspect --content payload sig.x  # verify a PKCS#7 signature
 fortitool pkg scan datafs/                     # classify files, find sigs
@@ -92,18 +98,24 @@ root CA.
 
 ## Supported firmware
 
-Across 167 unique images tested, with versions spanning FortiOS 3.0 through
+Coverage is specific to the product, package type and processing stage.
+FAZ/FMG firmware support does not establish support for their configuration
+backup secrets or for other Fortinet products.
+
+### FortiGate and FortiWiFi
+
+Across 167 unique FortiOS images tested, with versions spanning 3.0 through
 8.0, L1/header recovery succeeded for every image and matched an independent
 decoder byte-for-byte. This covers that stage and tested set only; later
 decryption and extraction remain format-dependent, as detailed below.
 
 | Layer | Coverage | Status |
 |---|---|---|
-| L1 `.out` outer cipher | v6.x through 8.0, all product lines | **Verified** against real FWF-60E images (7.4.7/7.4.10/7.4.11), byte-identical |
+| L1 `.out` outer cipher | Supported FortiOS `.out` layouts | **Verified** across the 167-image corpus described above; real FWF-60E 7.4.7/7.4.10/7.4.11 output is byte-identical to an independent decoder |
 | rootfs.gz — ChaCha20+RSA+AES-CTR family | 7.4.1–7.4.11 (ARM + x86_64 splits) | ARM path **verified** byte-identical against real firmware; x86_64 splits ported from public write-ups, covered by a synthetic round-trip test, not run against a real x86 sample |
 | rootfs.gz — ChaCha20 body (7.4.1–7.4.3 era) | seed-derived key/IV, non-RFC7539 counter | Ported from `fortigate-crypto`/Bishop Fox, covered by a synthetic round-trip test, not run against a real sample of that era |
 | rootfs.gz — XOR+RSA+{FORT-RC4,modified-RC4} family | 7.6.x, 8.0 | Ported from public write-ups (`fgx`, `forticrack_v8`), covered by a synthetic round-trip test, not run against a real sample |
-| Disk image layouts | appliance MBR+ext3 @512; **qcow2 VM disks** (FortiGate/FortiManager VM `.out` payloads); fixed-offset volumes (e.g. FortiManager @0x400000) | Appliance path **verified** byte-identical against real firmware; qcow2 reader + partition/ext4-extent discovery covered by synthetic round-trip tests, not yet run against a real VM image |
+| Disk image layouts | appliance MBR+ext3 @512; QCOW2 VM disks; fixed-offset volumes | Appliance path **verified** byte-identical against real firmware; QCOW2/partition and ext4-extent discovery covered by synthetic tests, not run against a real FortiGate VM image |
 | ext2/3 filesystem read | FSoC3/ARM appliance MBR+ext3 layout | **Verified** byte-identical against real firmware, including double-indirect block mapping |
 | ext4 extent-mapped read | FortiOS 8.0 VM rootfs (xz-compressed ext4 image) | Synthetic round-trip tests only, no real 8.0 sample available |
 | tar/gzip/xz unpack | any | **Verified** byte-identical against real firmware |
@@ -116,12 +128,78 @@ faithful port of a documented, working reference implementation, exercised
 by this repo's test suite, but not yet run against a real sample of that
 specific era — patches with real-firmware validation welcome.
 
-`decrypt` handles every known disk layout in one shot: appliance images
-(MBR + ext3 at sector 512), VM/KVM images (the decrypted payload is a
-qcow2 disk whose partitions are scanned for the FORTIOS volume), and
-fixed-offset layouts. The rootfs payload may be a gzip tar (through 7.6.x)
-or an xz-compressed ext4 filesystem image (8.0 VM builds) — both are
-unpacked natively.
+`decrypt` discovers supported ext filesystems in appliance, QCOW2 and
+fixed-offset disk layouts. Rootfs containers include gzip tar/CPIO and
+XZ CPIO/ext filesystems. Rootfs decompression is limited to 4 GiB.
+
+### FortiAnalyzer and FortiManager
+
+FAZ/FMG KVM installation disks are accepted as bare QCOW2 files or ZIP
+packages containing exactly one regular QCOW2 file, limited to 2 GiB after
+ZIP decompression. These disks have no L1 firmware header and use `vmlinuz`
+instead of `flatkc`. No product/version flag is required.
+
+Each row was tested as both an `FAZ_VM64_KVM` and an `FMG_VM64_KVM`
+`.out.kvm.zip` installation package: 24 packages in total. All completed
+inspection, full extraction and boot-only extraction. The release/build
+labels below are taken from their filenames; the older filenames specify
+only `v5` or `v6`, and their minor release numbers have not been established.
+Real-image end-to-end runs used the ZIP packages. Bare QCOW2 input shares
+the post-unzip reader and is covered separately by synthetic tests.
+
+| Release/build label (both FAZ and FMG) | Main rootfs |
+|---|---|
+| `v5-build0383` | gzip/newc CPIO |
+| `v5-build0786` | gzip/newc CPIO |
+| `v5-build1247` | XZ/newc CPIO |
+| `v5-build1821` | XZ/newc CPIO |
+| `v6-build0485` | XZ/newc CPIO |
+| `v6-build1565` | XZ/newc CPIO |
+| `v6-build2689` | XZ/newc CPIO |
+| `v7.0.16-build0710` | XZ/newc CPIO |
+| `v7.2.12-build1721` | XOR-protected kernel, AES-128-CTR XZ/newc CPIO rootfs |
+| `v7.4.11.M-build2804` | XOR-protected kernel, AES-128-CTR XZ/newc CPIO rootfs |
+| `v7.6.7.M-build3737` | XOR-protected kernel, AES-128-CTR XZ/newc CPIO rootfs |
+| `v8.0.1.F-build0189` | XOR-protected kernel, AES-128-CTR XZ/newc CPIO rootfs |
+
+Protected kernels are decoded using material recovered from their x86-64
+decompressor stubs. Rootfs candidates must pass the appended plaintext
+SHA-256 digest and complete XZ/CPIO validation. These checks confirm key
+selection and detect corruption. The digest is unkeyed and does not provide
+publisher authentication or protection against deliberate modification.
+Each base `init` matched independent libarchive extraction byte for byte.
+
+This coverage is for these KVM installation packages, not FAZ/FMG upgrade
+`.out` files, hardware appliances or other Fortinet products.
+
+```sh
+fortitool inspect FMG_VM64_KVM-v7.0.16-build0710-FORTINET.out.kvm.zip
+fortitool decrypt -o fmg FMG_VM64_KVM-v7.0.16-build0710-FORTINET.out.kvm.zip
+fortitool decrypt --boot-only -o boot faz.qcow2
+fortitool unpack -o extensions boot/rootfs-ext.tar.xz
+```
+
+The full FAZ/FMG extraction preserves the base root filesystem under `rootfs/`.
+Nested `bin.tar.xz`, `lib.tar.xz`, `usr.tar.xz`, `migadmin.tar.xz` and
+`node-scripts.tar.xz` archives, when present, are unpacked separately under
+`layers/rootfs/<archive-name>/`. Additional `syntax.tar.xz`,
+`rootfs-ext.tar.xz`, `docker.tar.xz` and `widgets.tar.gz` boot archives go
+under `layers/boot/<archive-name>/`. The original archives are retained.
+For example, `rootfs/bin/init` and `layers/rootfs/bin.tar.xz/bin/init` can
+contain different bootstrap and application programs. These outputs retain
+both versions for static analysis; they do not represent a merged bootable
+filesystem. Existing FortiGate extraction continues to merge its nested
+archives into `rootfs/`.
+
+`--boot-only` extracts readable directories, regular files and symlinks from
+the selected boot filesystem without rootfs decryption or archive expansion.
+The filesystem reader skips unreadable entries and special files such as
+device/FIFO nodes, so success does not certify a complete filesystem copy.
+This provides access to readable additional archives on newer images.
+Normal `decrypt` remains all-or-nothing and publishes no output when the
+main rootfs is unsupported.
+`inspect` reports the last recognised stage; a complete report does not
+validate nested archives or prove that the full extraction will succeed.
 
 ## Config-secret keys
 
@@ -144,7 +222,14 @@ feature if a backup may travel.
 
 ## How the auto-detection works
 
-Rather than requiring a version/architecture flag, `fortitool` locates the
+The input container determines whether an L1 firmware header is required.
+QCOW2 disks (bare or gzip-wrapped) and single-QCOW2 ZIP packages use the
+existing disk and filesystem readers. QCOW2 disks need no L1 header; when a
+validated header is present, its identity is retained. Other inputs require
+a validated L1 header. Volume selection requires a
+`flatkc` or `vmlinuz` kernel and `rootfs.gz`; plain gzip/XZ roots skip crypto.
+
+For FortiOS seed/RSA schemes, `fortitool` locates the
 32-byte seed and 270-byte obfuscated RSA public key FortiOS hides in the
 kernel by exploiting a structural fact: the recovered key always decrypts
 to a known ASN.1 DER prefix. Scanning for windows that satisfy that
@@ -153,19 +238,26 @@ several observed key-derivation splits, contiguous and near-contiguous
 layouts) — finds the right material without disassembling anything
 (no objdump/miasm/Ghidra needed). The same idea locates the outer L1 XOR
 key via a known-plaintext attack, and picks the rootfs body cipher
-(AES-CTR / FORT-RC4 / modified-RC4) by trying each against a probe and
-checking for the gzip magic bytes in the output.
+(AES-CTR / FORT-RC4 / modified-RC4) through candidate validation. Static
+ChaCha20 material is selected by complete gzip/tar validation.
+
+Protected FAZ/FMG x86-64 `vmlinuz` images carry repeating XOR material in
+their decompressor stub. The decoded kernel must pass gzip integrity and
+ELF bounds checks. Adjacent AES-128 key/IV candidates in that kernel are
+selected only when the rootfs plaintext matches its stored SHA-256 digest
+and passes complete XZ/CPIO validation. The keys and offsets are recovered
+from each image, rather than selected from a product/version table.
 
 ## Package layout
 
 ```
 internal/l1            outer .out XOR cipher (known-plaintext attack)
-internal/kernelpayload  flatkc -> decompressed kernel bytes
-internal/rootfscrypto   seed/RSA-key scanner + all rootfs.gz body ciphers
+internal/kernelpayload  flatkc / protected x86-64 vmlinuz -> kernel bytes
+internal/rootfscrypto   seed/RSA and static-material scanners + rootfs ciphers
 internal/qcow2          read-only qcow2 (VM disk) reader
 internal/diskimage      read-only ext2/ext3/ext4 (MBR partitions, fixed-offset
                         volumes, extent-mapped inodes, ExtractAll dump)
-internal/archive        tar/gzip/xz unpacking (stdlib + pure-Go xz)
+internal/archive        tar/newc CPIO, gzip/xz unpacking (stdlib + pure-Go xz)
 internal/pkcs7          PKCS#7 SignedData parse + detached-signature verify
 internal/configsecret   config-backup ENC secret decrypt, all eras
 cmd/fortitool           CLI wiring the above into the commands above
@@ -194,6 +286,10 @@ because no source was copied — but full credit is owed regardless):
 - **[hacefresko/forticrack_v8](https://github.com/hacefresko/forticrack_v8)** —
   the FortiOS 8.0 FORT-RC4 rootfs cipher (both FGT/FFW silicon variants)
   `internal/rootfscrypto`'s `fortRC4` is based on.
+- **[Bishop Fox, "A Brief Look at FortiJump"](https://bishopfox.com/blog/a-look-at-fortijump-cve-2024-47575)**
+  and **[Rapid7, "Rapid7 Analysis: CVE-2024-47575"](https://www.rapid7.com/blog/post/ra-cve-2024-47575-analysis/)** —
+  the FortiManager kernel XOR and static AES-128-CTR format descriptions
+  used for the independent FAZ/FMG decoder implementation.
 - **[hackintoanetwork/fgx](https://github.com/hackintoanetwork/fgx)** (GPL-3.0) —
   the FortiOS 7.6.x modified-RC4 rootfs cipher, and the disassembly-free
   seed/RSA-key scanning approach (contiguous + near-contiguous layouts)
@@ -224,10 +320,12 @@ anything you don't own or have explicit authorization to test.
 
 ## Contributing
 
-Issues and PRs welcome, especially real-firmware validation of the
-not-yet-verified paths in the table above (7.6.x, 8.0, x86_64 builds,
-qcow2 VM images). See [CONTRIBUTING.md](CONTRIBUTING.md) for the required
-checks and fixture policy.
+Issues and PRs welcome, especially validation of the unverified FortiOS
+paths above, FAZ/FMG upgrade `.out` packages and hardware images, or samples
+from other Fortinet product types. Report the exact product, version/build,
+package type and last successful stage; keep firmware and extracted files
+private. See [CONTRIBUTING.md](CONTRIBUTING.md) for the required checks and
+fixture policy.
 
 ## License
 
