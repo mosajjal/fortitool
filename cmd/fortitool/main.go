@@ -17,7 +17,7 @@ import (
 	"os"
 )
 
-const version = "0.1.0"
+var version = "0.1.0"
 
 // command describes one subcommand for the top-level help listing and
 // dispatch table.
